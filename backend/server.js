@@ -1,0 +1,4764 @@
+/**
+ * JMT TRAVELS — Express Master V1 Backend API Server
+ * Production-ready RESTful architecture with MongoDB Atlas/JSON persistence, JWT Auth, RBAC,
+ * Security & Auth Hardening (Task #2): Password Policies, Email Verification, Reset Tokens,
+ * Login Lockout, Session Revocation, IDOR Isolation, CORS Control, and MFA Architecture.
+ */
+
+const express = require('express');
+const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
+const cors = require('cors');
+const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const multer = require('multer');
+const https = require('https');
+require('dotenv').config();
+
+const db = require('./db');
+const paymentService = require('./services/payment');
+const notificationService = require('./services/notification');
+const chatbotService = require('./services/chatbot');
+const chatTools = require('./services/chatTools');
+const i18nService = require('./services/i18n');
+const cache = require('./services/cache');
+const zlib = require('zlib');
+const compression = require('compression');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const NODE_ENV = process.env.NODE_ENV || 'development';
+const AUTH_SECRET = process.env.AUTH_SECRET || (NODE_ENV !== 'production' ? 'local-development-jmt-jwt-secret-key' : null);
+if (!AUTH_SECRET && NODE_ENV === 'production') {
+  console.error('[FATAL SECURITY ERROR] AUTH_SECRET environment variable is missing in production. Application cannot start securely.');
+  process.exit(1);
+}
+
+// -------------------------------------------------------------
+// TRUST PROXY CONFIGURATION FOR RENDER / REVERSE PROXIES
+// -------------------------------------------------------------
+// Render operates behind a reverse proxy (1 hop). Setting 'trust proxy' to 1 (or process.env.TRUST_PROXY)
+// allows Express to securely parse client IP from the 1st proxy hop (Render load balancer),
+// preventing express-rate-limit ERR_ERL_UNEXPECTED_X_FORWARDED_FOR validation errors in production
+// without blindly trusting arbitrary client header chains.
+const trustProxyConfig = process.env.TRUST_PROXY
+  ? (/^\d+$/.test(process.env.TRUST_PROXY) ? parseInt(process.env.TRUST_PROXY, 10) : (process.env.TRUST_PROXY === 'true' ? true : process.env.TRUST_PROXY))
+  : 1;
+app.set('trust proxy', trustProxyConfig);
+
+// -------------------------------------------------------------
+// HELMET & SECURITY HEADERS (Phase 0F Hardened CSP)
+// -------------------------------------------------------------
+app.disable('x-powered-by');
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'", 'https://challenges.cloudflare.com'],
+      scriptSrcAttr: ["'unsafe-inline'"],
+      styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+      styleSrcAttr: ["'unsafe-inline'"],
+      fontSrc: ["'self'", 'https://fonts.gstatic.com', 'data:'],
+      imgSrc: ["'self'", 'data:', 'blob:', 'https:'],
+      connectSrc: ["'self'", 'https://jmttravels.com', 'https://www.jmttravels.com', 'https://secure.paytabs.com', 'https://checkout.thawani.om', 'https://challenges.cloudflare.com'],
+      frameSrc: ["'self'", 'https://www.google.com', 'https://maps.google.com', 'https://secure.paytabs.com', 'https://checkout.thawani.om', 'https://challenges.cloudflare.com'],
+      frameAncestors: ["'self'"],
+      baseUri: ["'self'"],
+      objectSrc: ["'none'"],
+      upgradeInsecureRequests: NODE_ENV === 'production' ? [] : null
+    }
+  },
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+  frameguard: { action: 'sameorigin' },
+  noSniff: true,
+  referrerPolicy: { policy: 'strict-origin-when-cross-origin' }
+}));
+
+// Environment-driven CORS configuration (Phase 0E)
+const configuredOrigins = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim()) : [];
+const defaultAllowedOrigins = [
+  'https://jmttravels.com',
+  'https://www.jmttravels.com'
+];
+if (NODE_ENV !== 'production') {
+  defaultAllowedOrigins.push('http://localhost:3000', 'http://127.0.0.1:3000');
+}
+const allowedOrigins = Array.from(new Set([...defaultAllowedOrigins, ...configuredOrigins]));
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || NODE_ENV === 'development' || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('CORS policy violation: Origin not allowed.'));
+    }
+  },
+  credentials: true
+}));
+
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// -------------------------------------------------------------
+// PERFORMANCE & SCALABILITY HARDENING (Task #11)
+// Compression, Cache Security, Slow Request Monitoring & Probes
+// -------------------------------------------------------------
+
+// High-Performance Response GZIP / Deflate Compression Middleware
+app.use(compression({
+  threshold: 1024,
+  filter: (req, res) => {
+    if (req.headers['x-no-compression']) return false;
+    return compression.filter(req, res);
+  }
+}));
+
+// Slow Request Detection Middleware (>500ms)
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    if (duration > 500) {
+      console.warn(`[SLOW REQUEST DETECTED] ${req.method} ${req.originalUrl || req.url} - ${duration}ms (Status: ${res.statusCode})`);
+    }
+  });
+  next();
+});
+
+// Cache-Control Security Policy Middleware
+app.use((req, res, next) => {
+  if (
+    req.path.startsWith('/api/admin') ||
+    req.path.startsWith('/api/account') ||
+    req.path.startsWith('/api/auth') ||
+    req.path.startsWith('/api/chat') ||
+    req.path.startsWith('/api/payments') ||
+    req.path.startsWith('/api/documents') ||
+    req.path.startsWith('/api/notifications') ||
+    req.path.startsWith('/documents/') ||
+    req.method !== 'GET'
+  ) {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+  }
+  next();
+});
+
+// Health & Readiness Probes
+app.get(['/health', '/api/health'], (req, res) => {
+  const dbStatus = db.getStatus();
+  res.json({
+    status: 'ok',
+    mode: dbStatus.mode,
+    mongoConnected: dbStatus.isConnected,
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.get(['/ready', '/api/ready'], (req, res) => {
+  const dbStatus = db.getStatus();
+  if (dbStatus.isConnected || !db.isProductionDBRequired()) {
+    res.json({ ready: true, status: 'READY', db: dbStatus });
+  } else {
+    res.status(503).json({ ready: false, status: 'NOT_READY', db: dbStatus });
+  }
+});
+
+// -------------------------------------------------------------
+// DYNAMIC SEO ENDPOINTS (Task #10)
+// Must be registered BEFORE express.static to override static sitemap/robots files
+// -------------------------------------------------------------
+
+// Dynamic XML Sitemap Endpoint
+app.get('/sitemap.xml', async (req, res) => {
+  try {
+    const baseUrl = process.env.BASE_URL || 'https://jmttravels.com';
+    const allPackages = await db.tourPackages.find();
+    const packages = allPackages.filter(p => p.published !== false);
+    const visas = await db.visaServices.find();
+
+    const staticRoutes = [
+      { url: '/', priority: '1.0', changefreq: 'daily' },
+      { url: '/visa', priority: '0.9', changefreq: 'weekly' },
+      { url: '/tourism', priority: '0.9', changefreq: 'weekly' },
+      { url: '/contact', priority: '0.7', changefreq: 'monthly' },
+      { url: '/privacy', priority: '0.3', changefreq: 'monthly' },
+      { url: '/terms', priority: '0.3', changefreq: 'monthly' },
+      { url: '/refund-policy', priority: '0.3', changefreq: 'monthly' },
+      { url: '/cancellation-policy', priority: '0.3', changefreq: 'monthly' }
+    ];
+
+    let xml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n`;
+
+    staticRoutes.forEach(r => {
+      xml += `  <url>\n    <loc>${baseUrl}${r.url}</loc>\n    <changefreq>${r.changefreq}</changefreq>\n    <priority>${r.priority}</priority>\n  </url>\n`;
+    });
+
+    packages.forEach(p => {
+      if (p.slug) {
+        xml += `  <url>\n    <loc>${baseUrl}/tourism/${p.slug}</loc>\n    <changefreq>weekly</changefreq>\n    <priority>0.8</priority>\n  </url>\n`;
+      }
+    });
+
+    visas.forEach(v => {
+      if (v.slug) {
+        xml += `  <url>\n    <loc>${baseUrl}/visa/${v.slug}</loc>\n    <changefreq>weekly</changefreq>\n    <priority>0.8</priority>\n  </url>\n`;
+      }
+    });
+
+    xml += `</urlset>`;
+
+    res.header('Content-Type', 'application/xml');
+    res.send(xml);
+  } catch (err) {
+    res.status(500).send('Error generating sitemap');
+  }
+});
+
+// Dynamic Robots.txt Endpoint
+app.get('/robots.txt', (req, res) => {
+  const baseUrl = process.env.BASE_URL || 'https://jmttravels.com';
+  const robotsText = `User-agent: *
+Disallow: /admin
+Disallow: /api/
+Disallow: /account
+Disallow: /visa-apply
+Disallow: /book
+Disallow: /documents/
+
+Sitemap: ${baseUrl}/sitemap.xml
+`;
+  res.header('Content-Type', 'text/plain');
+  res.send(robotsText);
+});
+
+// Serve static frontend files with production Cache-Control headers
+app.use(express.static(path.join(__dirname, '../frontend/public'), {
+  maxAge: '1d',
+  etag: true,
+  lastModified: true,
+  setHeaders: (res, filePath) => {
+    // 1. HTML documents must always be revalidated so updates are seen immediately
+    if (filePath.endsWith('.html')) {
+      res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
+    }
+    // 2. Static media assets (images, webp, svg, fonts) can be cached long-term (30 days)
+    else if (/\.(jpe?g|png|webp|svg|gif|ico|woff2?|ttf|eot)$/i.test(filePath)) {
+      res.setHeader('Cache-Control', 'public, max-age=2592000, immutable');
+    }
+    // 3. CSS & JS scripts can be cached with 1 day max-age
+    else if (/\.(css|js)$/i.test(filePath)) {
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+    }
+  }
+}));
+
+// -------------------------------------------------------------
+// RATE LIMITING (Task #2 Section 9)
+// -------------------------------------------------------------
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 500,
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, error: { code: 'RATE_LIMITED', message: 'Too many authentication attempts. Please wait 15 minutes.' } }
+});
+
+const registerLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: { success: false, error: { code: 'RATE_LIMITED', message: 'Too many account registrations. Please wait 15 minutes.' } }
+});
+
+const submissionLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 15,
+  message: { success: false, error: { code: 'RATE_LIMITED', message: 'Too many submissions. Please wait 15 minutes.' } }
+});
+
+const uploadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, error: { code: 'RATE_LIMITED', message: 'Too many file upload requests. Please wait 15 minutes.' } }
+});
+
+const adminLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 150,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, error: { code: 'RATE_LIMITED', message: 'Too many administrative requests. Please wait 15 minutes.' } }
+});
+
+app.use('/api/admin/', adminLimiter);
+app.use('/api/', globalLimiter);
+
+// -------------------------------------------------------------
+// SENSITIVE DATA EXPOSURE PREVENTION (Task #2 Section 18)
+// -------------------------------------------------------------
+function sanitizeUser(user) {
+  if (!user) return null;
+  const obj = typeof user.toObject === 'function' ? user.toObject() : { ...user };
+  delete obj.passwordHash;
+  delete obj.verificationToken;
+  delete obj.verificationTokenExpires;
+  delete obj.resetPasswordToken;
+  delete obj.resetPasswordExpires;
+  delete obj.mfaSecret;
+  delete obj.__v;
+  return obj;
+}
+
+function hashToken(rawToken) {
+  return crypto.createHash('sha256').update(String(rawToken)).digest('hex');
+}
+
+// PASSPORT MASKING HELPER (V5.1 Customer Profile Foundation)
+function maskPassport(passport) {
+  if (!passport || typeof passport !== 'string') return null;
+  const trimmed = passport.trim();
+  if (trimmed.length === 0) return null;
+  if (trimmed.length <= 4) {
+    return '•'.repeat(trimmed.length);
+  }
+  return '••••••' + trimmed.slice(-4);
+}
+
+// Multer Storage Setup for Private Passport/Identity Documents
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, db.PRIVATE_UPLOADS_DIR),
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase();
+    const safeName = `doc_${Date.now()}_${crypto.randomBytes(4).toString('hex')}${ext}`;
+    cb(null, safeName);
+  }
+});
+
+const upload = multer({
+  storage,
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
+    if (allowedTypes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only JPEG, PNG, WEBP, and PDF documents are allowed.'));
+    }
+  }
+});
+
+// Seed Initial Catalogue Data
+async function seedInitialData() {
+  const existingPackages = await db.tourPackages.find();
+  if (existingPackages.length === 0) {
+    await db.tourPackages.create({
+      slug: 'dubai-desert-escape',
+      title: 'Dubai Desert Escape',
+      destination: 'Dubai',
+      category: 'City Tours',
+      duration: '4 nights',
+      durationDays: 5,
+      priceMinor: 189000,
+      currency: 'OMR',
+      image: '/assets/destinations/dubai_1.jpg',
+      summary: 'Explore Dubai with premium city tours, desert safari, and airport transfers.',
+      highlights: ['Airport Transfers', 'Desert Safari with Dinner', 'Burj Khalifa View'],
+      inclusions: ['4-star hotel stay', 'Daily breakfast', 'Guided tours'],
+      exclusions: ['International flights', 'Personal expenses'],
+      published: true,
+      featured: true
+    });
+
+    await db.tourPackages.create({
+      slug: 'salalah-khareef-retreat',
+      title: 'Salalah Khareef Retreat',
+      destination: 'Salalah',
+      category: 'Family',
+      duration: '3 nights',
+      durationDays: 4,
+      priceMinor: 129000,
+      currency: 'OMR',
+      image: '/assets/destinations/salalah_1.jpg',
+      summary: 'Experience the green waterfalls and cool climate of Salalah during Khareef.',
+      highlights: ['Wadi Darbat Tour', 'Mughsail Blowholes', 'Custom Private Vehicle'],
+      inclusions: ['Resort stay', 'Breakfast & dinner', 'Airport transfers'],
+      exclusions: ['Flights'],
+      published: true,
+      featured: true
+    });
+
+    await db.tourPackages.create({
+      slug: 'umrah-made-serene',
+      title: 'Umrah, Made Serene',
+      destination: 'Makkah & Madinah',
+      category: 'Religious',
+      duration: '7 nights',
+      durationDays: 8,
+      priceMinor: 249000,
+      currency: 'OMR',
+      image: '/assets/destinations/umrah_1.jpg',
+      summary: 'Guided Umrah package with luxury transfers and close-to-Haram stays.',
+      highlights: ['Haram-facing accommodation', 'High-speed train transfers', 'Guided Ziyarat'],
+      inclusions: ['5-star hotel in Makkah & Madinah', 'Visa processing assistance'],
+      exclusions: ['Personal items'],
+      published: true,
+      featured: true
+    });
+  }
+
+  const existingVisas = await db.visaServices.find();
+  if (existingVisas.length === 0) {
+    await db.visaServices.create({
+      slug: 'uae-tourist-visa',
+      country: 'United Arab Emirates',
+      visaType: 'Tourist',
+      validity: '60 Days',
+      processingTime: '24–48 Hours',
+      entryType: 'Single / Multiple',
+      priceMinor: 45000,
+      currency: 'OMR',
+      overview: 'Fast-track UAE tourist visa clearing for Oman residents and international visitors.',
+      eligibility: 'Valid passport with at least 6 months validity.',
+      requiredDocuments: ['Passport Copy', 'Passport Photo', 'Oman Resident Card (if applicable)'],
+      published: true
+    });
+
+    await db.visaServices.create({
+      slug: 'saudi-visit-visa',
+      country: 'Saudi Arabia',
+      visaType: 'Tourist / Visit',
+      validity: '1 Year Multiple Entry',
+      processingTime: '24 Hours',
+      entryType: 'Multiple',
+      priceMinor: 55000,
+      currency: 'OMR',
+      overview: 'Saudi e-Visa clearing for Umrah, business, and leisure travel.',
+      eligibility: 'Eligible nationalities or GCC residency holder.',
+      requiredDocuments: ['Passport Copy', 'Photo'],
+      published: true
+    });
+  }
+
+  const omanServices = [
+    {
+      slug: 'oman-tourist-visa',
+      country: 'Oman',
+      visaType: 'Tourist',
+      validity: '30 Days / 10 Days',
+      processingTime: '24–48 Hours',
+      entryType: 'Single / Express',
+      priceMinor: 20000,
+      currency: 'OMR',
+      overview: "Explore Oman's mountains, beaches, deserts, forts, and cultural destinations with convenient visa assistance.",
+      eligibility: 'Valid passport with at least 6 months validity.',
+      requiredDocuments: ['Passport Copy', 'Passport Photo', 'Flight & Hotel Reservation'],
+      published: true
+    },
+    {
+      slug: 'oman-business-visa',
+      country: 'Oman',
+      visaType: 'Business',
+      validity: '21 Days / 1 Year',
+      processingTime: '24–48 Hours',
+      entryType: 'Single / Multiple',
+      priceMinor: 35000,
+      currency: 'OMR',
+      overview: 'Professional visa assistance for corporate delegations, commercial meetings, and trade conferences in Muscat.',
+      eligibility: 'Business invitation letter or commercial registration.',
+      requiredDocuments: ['Passport Copy', 'Company Invitation Letter', 'Passport Photo'],
+      published: true
+    },
+    {
+      slug: 'oman-family-visa',
+      country: 'Oman',
+      visaType: 'Family Visit',
+      validity: '30 Days / 3 Months',
+      processingTime: '48 Hours',
+      entryType: 'Single / Multiple',
+      priceMinor: 25000,
+      currency: 'OMR',
+      overview: 'Dedicated document clearing for visiting relatives, family reunions, and expatriate family entry to Oman.',
+      eligibility: 'Resident sponsor proof or family relation proof.',
+      requiredDocuments: ['Passport Copy', 'Sponsor Resident Card', 'Relationship Proof'],
+      published: true
+    }
+  ];
+
+  for (const s of omanServices) {
+    const exists = await db.visaServices.findOne({ slug: s.slug });
+    if (!exists) {
+      await db.visaServices.create(s);
+    }
+  }
+
+  // Seed Admin User
+  const adminEmail = (process.env.ADMIN_EMAIL || 'admin@jmttravels.com').toLowerCase();
+  const existingAdmin = await db.users.findOne({ email: adminEmail });
+  if (!existingAdmin) {
+    let adminPass = process.env.ADMIN_PASSWORD;
+    if (!adminPass) {
+      if (NODE_ENV === 'production') {
+        console.warn('[Security Warning] ADMIN_PASSWORD environment variable not set. Admin account seeding skipped in production.');
+        return;
+      }
+      // Safe development/test-only fallback (never used in production)
+      adminPass = 'JMTAdmin2026!';
+    }
+    const passwordHash = bcrypt.hashSync(adminPass, 12);
+    await db.users.create({
+      name: 'JMT Super Admin',
+      email: adminEmail,
+      passwordHash,
+      role: 'SUPER_ADMIN',
+      status: 'ACTIVE',
+      verified: true
+    });
+    console.log(`[Seed] Created admin account: ${adminEmail}`);
+  }
+}
+
+// -------------------------------------------------------------
+// JWT & AUTHENTICATION MIDDLEWARE (Task #2 Section 6 & 7)
+// -------------------------------------------------------------
+function generateToken(user) {
+  // Payload contains ONLY safe identifiers: sub, role, email. NO passwords or secrets!
+  return jwt.sign({ sub: user.id, role: user.role, email: user.email }, AUTH_SECRET, { expiresIn: '7d' });
+}
+
+async function authenticate(req, res, next) {
+  try {
+    const authHeader = req.get('authorization') || '';
+    const cookieHeader = req.get('cookie') || '';
+    let token = '';
+
+    if (authHeader.startsWith('Bearer ')) {
+      token = authHeader.slice(7).trim();
+    } else if (cookieHeader.includes('jmt_session=')) {
+      token = decodeURIComponent(cookieHeader.split('jmt_session=')[1].split(';')[0]);
+    } else {
+      const adminKey = req.get('x-admin-key');
+      if (adminKey && process.env.ADMIN_ACCESS_KEY && process.env.ADMIN_ACCESS_KEY.length >= 16 && adminKey === process.env.ADMIN_ACCESS_KEY) {
+        req.user = { id: 'admin-key-user', role: 'ADMIN', name: 'Staff Access Key', status: 'ACTIVE' };
+        return next();
+      }
+    }
+
+    if (!token) {
+      return res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Authentication required.' } });
+    }
+
+    const payload = jwt.verify(token, AUTH_SECRET);
+    const user = await db.users.findById(payload.sub);
+    if (!user) {
+      return res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'User session invalid.' } });
+    }
+
+    // Check Account Status (Task #2 Section 20)
+    if (user.status === 'SUSPENDED' || user.status === 'DISABLED') {
+      return res.status(403).json({ success: false, error: { code: 'ACCOUNT_SUSPENDED', message: 'Account is suspended or disabled.' } });
+    }
+
+    // Check Token Revocation / Session Invalidation (Task #2 Section 7)
+    if (user.tokenInvalidatedBefore) {
+      const tokenIat = payload.iat || 0;
+      const revokedTime = Math.floor(new Date(user.tokenInvalidatedBefore).getTime() / 1000);
+      if (tokenIat < revokedTime) {
+        return res.status(401).json({ success: false, error: { code: 'TOKEN_REVOKED', message: 'Token has been revoked. Please sign in again.' } });
+      }
+    }
+
+    req.user = user;
+    next();
+  } catch (err) {
+    return res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Session expired or invalid token.' } });
+  }
+}
+
+async function optionalAuth(req, res, next) {
+  try {
+    const authHeader = req.get('authorization') || '';
+    const cookieHeader = req.get('cookie') || '';
+    let token = '';
+
+    if (authHeader.startsWith('Bearer ')) {
+      token = authHeader.slice(7).trim();
+    } else if (cookieHeader.includes('jmt_session=')) {
+      token = decodeURIComponent(cookieHeader.split('jmt_session=')[1].split(';')[0]);
+    }
+
+    if (token) {
+      const payload = jwt.verify(token, AUTH_SECRET);
+      const user = await db.users.findById(payload.sub);
+      if (user && user.status !== 'SUSPENDED' && user.status !== 'DISABLED') {
+        req.user = user;
+      }
+    }
+  } catch (err) {
+    // Ignore invalid optional token
+  }
+  next();
+}
+
+function i18nMiddleware(req, res, next) {
+  // Locale Priority Selection (PDF #7 Section 3)
+  // 1. Explicit request parameter / header (?lang=ar, ?locale=ar, X-App-Locale: ar)
+  // 2. Authenticated customer profile preference (req.user?.preferredLanguage)
+  // 3. Browser Accept-Language header
+  // 4. Application default ('en')
+  let requestedLocale = req.query.lang || req.query.locale || req.get('x-app-locale');
+
+  if (!requestedLocale && req.user?.preferredLanguage) {
+    requestedLocale = req.user.preferredLanguage;
+  }
+
+  if (!requestedLocale) {
+    const acceptLang = req.get('accept-language') || '';
+    if (acceptLang.toLowerCase().includes('ar')) {
+      requestedLocale = 'ar';
+    } else if (acceptLang.toLowerCase().includes('en')) {
+      requestedLocale = 'en';
+    }
+  }
+
+  if (requestedLocale && !i18nService.isSupportedLocale(requestedLocale)) {
+    return res.status(400).json({
+      success: false,
+      error: { code: 'INVALID_LOCALE', message: 'Unsupported locale requested. Supported locales are: en, ar.' }
+    });
+  }
+
+  req.locale = i18nService.normalizeLocale(requestedLocale);
+
+  let requestedCurrency = req.query.currency || req.get('x-app-currency');
+  if (!requestedCurrency && req.user?.preferredCurrency) {
+    requestedCurrency = req.user.preferredCurrency;
+  }
+
+  if (requestedCurrency && !i18nService.isSupportedCurrency(requestedCurrency)) {
+    return res.status(400).json({
+      success: false,
+      error: { code: 'INVALID_CURRENCY', message: 'Unsupported currency requested. Supported currencies are: OMR, AED, SAR, INR, USD.' }
+    });
+  }
+
+  req.currency = i18nService.normalizeCurrency(requestedCurrency);
+  req.isRTL = i18nService.isRTL(req.locale);
+  req.dir = i18nService.getDirection(req.locale);
+
+  next();
+}
+
+app.use('/api/', optionalAuth, i18nMiddleware);
+
+function authorize(...allowedRoles) {
+  return (req, res, next) => {
+    if (!req.user || !allowedRoles.includes(req.user.role)) {
+      return res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'You lack permission to access this administrative resource.' } });
+    }
+    next();
+  };
+}
+
+async function logAudit(req, action, entityType, entityId, metadata = {}) {
+  try {
+    const cleanMeta = metadata && typeof metadata === 'object' ? { ...metadata } : {};
+    const sensitiveKeys = ['password', 'passwordHash', 'token', 'secret', 'apiKey', 'key', 'authHeader', 'authorization', 'cookie', 'passportNumber'];
+    for (const k of Object.keys(cleanMeta)) {
+      if (sensitiveKeys.some(s => k.toLowerCase().includes(s.toLowerCase()))) {
+        cleanMeta[k] = '[REDACTED]';
+      }
+    }
+    await db.auditLogs.create({
+      actorId: req && req.user ? req.user.id : 'ANONYMOUS',
+      actorRole: req && req.user ? req.user.role : 'GUEST',
+      action,
+      entityType,
+      entityId,
+      metadata: cleanMeta
+    });
+  } catch (err) {
+    console.error('[Audit Log Error]:', err.message);
+  }
+}
+
+// =============================================================
+// API ROUTES
+// =============================================================
+
+// --- 1. HEALTH & READINESS CHECKS ---
+app.get('/health', (req, res) => res.json({ status: 'ok', service: 'JMT TRAVELS V1 API', timestamp: new Date().toISOString() }));
+app.get('/api/health', (req, res) => res.json({ status: 'ok', service: 'JMT TRAVELS API' }));
+
+app.get('/ready', (req, res) => {
+  const status = db.getStatus();
+  if (status.isProduction && !status.isConnected) {
+    return res.status(503).json({
+      ready: false,
+      error: 'Database service unavailable. Required MongoDB connection is offline.',
+      timestamp: new Date().toISOString()
+    });
+  }
+  res.json({
+    ready: true,
+    storage: status.isConnected ? 'MongoDB Atlas' : 'Persistent JSON',
+    mode: status.mode,
+    timestamp: new Date().toISOString()
+  });
+});
+
+// --- 2. AUTHENTICATION & USER MANAGEMENT ---
+
+app.get('/api/config/public', (req, res) => {
+  const siteKey = process.env.TURNSTILE_SITE_KEY;
+  const secretKey = process.env.TURNSTILE_SECRET_KEY;
+  res.json({
+    turnstileEnabled: Boolean(siteKey && secretKey),
+    turnstileSiteKey: siteKey && secretKey ? siteKey : ''
+  });
+});
+
+function verifyTurnstileToken(token, remoteIp) {
+  return new Promise((resolve, reject) => {
+    const body = new URLSearchParams({
+      secret: process.env.TURNSTILE_SECRET_KEY,
+      response: token
+    });
+    if (remoteIp) body.set('remoteip', remoteIp);
+
+    const request = https.request('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(body.toString())
+      },
+      timeout: 5000
+    }, response => {
+      let responseBody = '';
+      response.setEncoding('utf8');
+      response.on('data', chunk => { responseBody += chunk; });
+      response.on('end', () => {
+        if (response.statusCode !== 200) {
+          reject(new Error(`Turnstile verification returned HTTP ${response.statusCode}.`));
+          return;
+        }
+        try {
+          resolve(JSON.parse(responseBody));
+        } catch (err) {
+          reject(new Error(`Turnstile verification returned invalid JSON: ${err.message}`));
+        }
+      });
+    });
+
+    request.on('timeout', () => request.destroy(new Error('Turnstile verification timed out.')));
+    request.on('error', reject);
+    request.end(body.toString());
+  });
+}
+
+// CUSTOMER REGISTRATION & MASS ASSIGNMENT PROTECTION (Task #2 Section 4, 10, 16, 17)
+app.post('/api/auth/register', registerLimiter, async (req, res) => {
+  try {
+    const { name, email, password, phone, termsAccepted, cookiesAccepted, captchaToken } = req.body || {};
+    const cleanEmail = (email || '').trim().toLowerCase();
+    const cleanName = (name || '').trim();
+
+    // Password Policy Validation (Task #2 Section 3)
+    if (!cleanName || cleanName.length < 2 || cleanName.length > 80) {
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Valid full name (2–80 characters) is required.' } });
+    }
+    if (!cleanEmail || !cleanEmail.includes('@') || cleanEmail.length > 120) {
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Valid email address is required.' } });
+    }
+    if (!password || password.length < 8 || password.length > 128) {
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Password must be between 8 and 128 characters.' } });
+    }
+    if (termsAccepted !== true || cookiesAccepted !== true) {
+      return res.status(400).json({ success: false, error: { code: 'CONSENT_REQUIRED', message: 'Please accept the Terms & Conditions, Privacy Policy, and Cookie Policy before registering.' } });
+    }
+    if (!process.env.TURNSTILE_SITE_KEY || !process.env.TURNSTILE_SECRET_KEY) {
+      return res.status(503).json({ success: false, error: { code: 'CAPTCHA_NOT_CONFIGURED', message: 'Registration verification is not configured. Please contact the site administrator.' } });
+    }
+    if (typeof captchaToken !== 'string' || !captchaToken) {
+      return res.status(400).json({ success: false, error: { code: 'CAPTCHA_REQUIRED', message: 'Please complete the CAPTCHA verification.' } });
+    }
+
+    let captchaResult;
+    try {
+      captchaResult = await verifyTurnstileToken(captchaToken, req.ip);
+    } catch (err) {
+      console.error('[CAPTCHA Error] Turnstile verification failed:', err.message);
+      return res.status(503).json({ success: false, error: { code: 'CAPTCHA_VERIFICATION_UNAVAILABLE', message: 'CAPTCHA verification is temporarily unavailable. Please try again.' } });
+    }
+    if (!captchaResult.success) {
+      return res.status(400).json({ success: false, error: { code: 'CAPTCHA_INVALID', message: 'CAPTCHA verification failed. Please try again.' } });
+    }
+
+    const existing = await db.users.findOne({ email: cleanEmail });
+    if (existing) {
+      return res.status(400).json({ success: false, error: { code: 'USER_EXISTS', message: 'An account with this email already exists.' } });
+    }
+
+    // Generate Verification Token (Task #2 Section 4)
+    const rawVerificationToken = crypto.randomBytes(32).toString('hex');
+    const hashedVerificationToken = hashToken(rawVerificationToken);
+
+    const passwordHash = bcrypt.hashSync(password, 12);
+
+    // MASS ASSIGNMENT PROTECTION: Hardcode role to CUSTOMER, ignore client role/isAdmin claims!
+    const user = await db.users.create({
+      name: cleanName,
+      email: cleanEmail,
+      phone: phone || '',
+      passwordHash,
+      termsAcceptedAt: new Date(),
+      privacyPolicyAcceptedAt: new Date(),
+      cookiePolicyAcceptedAt: new Date(),
+      role: 'CUSTOMER',
+      status: 'UNVERIFIED',
+      verified: false,
+      verificationToken: hashedVerificationToken,
+      verificationTokenExpires: new Date(Date.now() + 24 * 3600 * 1000) // 24 hours
+    });
+
+    const token = generateToken(user);
+    await notificationService.dispatchEvent('EMAIL_VERIFICATION', { user, token: rawVerificationToken });
+
+    res.status(201).json({
+      success: true,
+      token,
+      user: sanitizeUser(user),
+      message: 'Account created successfully. A verification email has been sent.'
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// EMAIL VERIFICATION ENDPOINT (Task #2 Section 4)
+app.post('/api/auth/verify-email', authLimiter, async (req, res) => {
+  try {
+    const { token } = req.body || {};
+    if (!token) {
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Verification token is required.' } });
+    }
+
+    const hashed = hashToken(token);
+    const user = await db.users.findOne({ verificationToken: hashed });
+
+    if (!user || !user.verificationTokenExpires || new Date(user.verificationTokenExpires) < new Date()) {
+      return res.status(400).json({ success: false, error: { code: 'INVALID_TOKEN', message: 'Invalid or expired verification token.' } });
+    }
+
+    await db.users.update(user.id, {
+      verified: true,
+      status: 'ACTIVE',
+      verificationToken: null,
+      verificationTokenExpires: null
+    });
+
+    await logAudit({ user }, 'EMAIL_VERIFIED', 'USER', user.id);
+    res.json({ success: true, message: 'Email address verified successfully.' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// RESEND VERIFICATION EMAIL (Task #2 Section 4)
+app.post('/api/auth/resend-verification', authLimiter, async (req, res) => {
+  const { email } = req.body || {};
+  const cleanEmail = (email || '').trim().toLowerCase();
+
+  // Generic response to avoid leaking email existence
+  const genericResponse = { success: true, message: 'If an unverified account exists with that email, a new verification token has been dispatched.' };
+
+  if (!cleanEmail) return res.json(genericResponse);
+
+  const user = await db.users.findOne({ email: cleanEmail });
+  if (user && !user.verified) {
+    const rawToken = crypto.randomBytes(32).toString('hex');
+    await db.users.update(user.id, {
+      verificationToken: hashToken(rawToken),
+      verificationTokenExpires: new Date(Date.now() + 24 * 3600 * 1000)
+    });
+    await notificationService.dispatchEvent('EMAIL_VERIFICATION', { user, token: rawToken });
+  }
+
+  res.json(genericResponse);
+});
+
+// CUSTOMER & STAFF LOGIN WITH LOCKOUT PROTECTION (Task #2 Section 8)
+app.post('/api/auth/login', authLimiter, async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    const cleanEmail = (email || '').trim().toLowerCase();
+    const genericAuthError = { success: false, error: { code: 'INVALID_CREDENTIALS', message: 'Invalid email or password.' } };
+
+    if (!cleanEmail || !password) return res.status(401).json(genericAuthError);
+
+    const user = await db.users.findOne({ email: cleanEmail });
+    if (!user || !user.passwordHash) {
+      return res.status(401).json(genericAuthError);
+    }
+
+    // Check Account Lockout (Task #2 Section 8)
+    if (user.lockUntil && new Date(user.lockUntil) > new Date()) {
+      await logAudit(null, 'BLOCKED_LOCKED_LOGIN_ATTEMPT', 'USER', user.id);
+      return res.status(401).json(genericAuthError);
+    }
+
+    // Check Account Status (Task #2 Section 20)
+    if (user.status === 'SUSPENDED' || user.status === 'DISABLED') {
+      return res.status(403).json({ success: false, error: { code: 'ACCOUNT_SUSPENDED', message: 'Account is suspended or disabled.' } });
+    }
+
+    // Password Check
+    const match = bcrypt.compareSync(password, user.passwordHash);
+    if (!match) {
+      const attempts = (user.failedLoginAttempts || 0) + 1;
+      let lockUntil = null;
+      if (attempts >= 5) {
+        lockUntil = new Date(Date.now() + 15 * 60 * 1000); // 15 min temporary lockout
+        await logAudit(null, 'ACCOUNT_LOCKED_TEMPORARY', 'USER', user.id, { attempts });
+      }
+      await db.users.update(user.id, { failedLoginAttempts: attempts, lockUntil });
+      await logAudit(null, 'FAILED_LOGIN_ATTEMPT', 'USER', user.id);
+      return res.status(401).json(genericAuthError);
+    }
+
+    // Successful Login: Reset Lockout Counters
+    await db.users.update(user.id, { failedLoginAttempts: 0, lockUntil: null });
+    await logAudit({ user }, user.role.includes('ADMIN') ? 'ADMIN_LOGIN' : 'USER_LOGIN', 'USER', user.id);
+
+    const token = generateToken(user);
+    res.json({
+      success: true,
+      token,
+      user: sanitizeUser(user)
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// FORGOT PASSWORD REQUEST (Task #2 Section 5)
+app.post('/api/auth/forgot-password', authLimiter, async (req, res) => {
+  const { email } = req.body || {};
+  const cleanEmail = (email || '').trim().toLowerCase();
+
+  // GENERIC RESPONSE: NEVER REVEAL ACCOUNT EXISTENCE!
+  const genericMsg = { success: true, message: 'If an account with that email exists, password reset instructions have been sent.' };
+  if (!cleanEmail) return res.json(genericMsg);
+
+  const user = await db.users.findOne({ email: cleanEmail });
+  if (user) {
+    const rawResetToken = crypto.randomBytes(32).toString('hex');
+    const hashedResetToken = hashToken(rawResetToken);
+
+    await db.users.update(user.id, {
+      resetPasswordToken: hashedResetToken,
+      resetPasswordExpires: new Date(Date.now() + 3600 * 1000) // 1 hour
+    });
+
+    await logAudit(null, 'PASSWORD_RESET_REQUEST', 'USER', user.id);
+    await notificationService.dispatchEvent('PASSWORD_RESET', { user, token: rawResetToken });
+  }
+
+  res.json(genericMsg);
+});
+
+// RESET PASSWORD EXECUTION (Task #2 Section 5)
+app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
+  try {
+    const { token, newPassword, confirmPassword } = req.body || {};
+
+    if (!token || !newPassword || newPassword.length < 8 || newPassword.length > 128) {
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Valid password (min 8 characters) is required.' } });
+    }
+    if (confirmPassword && newPassword !== confirmPassword) {
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Passwords do not match.' } });
+    }
+
+    const hashed = hashToken(token);
+    const user = await db.users.findOne({ resetPasswordToken: hashed });
+
+    if (!user || !user.resetPasswordExpires || new Date(user.resetPasswordExpires) < new Date()) {
+      return res.status(400).json({ success: false, error: { code: 'INVALID_TOKEN', message: 'Invalid or expired password reset token.' } });
+    }
+
+    const newHash = bcrypt.hashSync(newPassword, 12);
+    await db.users.update(user.id, {
+      passwordHash: newHash,
+      resetPasswordToken: null,
+      resetPasswordExpires: null,
+      passwordChangedAt: new Date(),
+      tokenInvalidatedBefore: new Date(), // Revokes all active sessions/JWTs!
+      failedLoginAttempts: 0,
+      lockUntil: null
+    });
+
+    await logAudit({ user }, 'PASSWORD_RESET', 'USER', user.id);
+    res.json({ success: true, message: 'Password reset successfully. Please sign in with your new password.' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// LOGOUT & SESSION REVOCATION (Task #2 Section 7)
+app.post('/api/auth/logout', authenticate, async (req, res) => {
+  try {
+    // Revoke token by updating user tokenInvalidatedBefore timestamp
+    await db.users.update(req.user.id, { tokenInvalidatedBefore: new Date() });
+    await logAudit(req, 'USER_LOGOUT', 'USER', req.user.id);
+    res.json({ success: true, message: 'Signed out successfully. Active sessions revoked.' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET CURRENT USER PROFILE
+app.get('/api/auth/me', authenticate, async (req, res) => {
+  res.json({ success: true, user: sanitizeUser(req.user) });
+});
+
+// UPDATE USER PREFERENCES (Language & Currency - Task #7)
+app.patch('/api/users/preferences', authenticate, async (req, res) => {
+  try {
+    const { preferredLanguage, preferredCurrency } = req.body || {};
+    const updates = {};
+
+    if (preferredLanguage) {
+      if (!i18nService.isSupportedLocale(preferredLanguage)) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'INVALID_LOCALE', message: 'Unsupported locale. Allowed: en, ar.' }
+        });
+      }
+      updates.preferredLanguage = preferredLanguage;
+    }
+
+    if (preferredCurrency) {
+      if (!i18nService.isSupportedCurrency(preferredCurrency)) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'INVALID_CURRENCY', message: 'Unsupported currency. Allowed: OMR, AED, SAR, INR, USD.' }
+        });
+      }
+      updates.preferredCurrency = preferredCurrency.toUpperCase();
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'VALIDATION_ERROR', message: 'At least one preference (preferredLanguage or preferredCurrency) must be specified.' }
+      });
+    }
+
+    const updatedUser = await db.users.update(req.user.id, updates);
+    await logAudit(req, 'UPDATE_PREFERENCES', 'USER', req.user.id, updates);
+
+    res.json({
+      success: true,
+      user: sanitizeUser(updatedUser),
+      message: 'User preferences updated successfully.'
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// =============================================================
+// --- CUSTOMER PROFILE SELF-SERVICE ENDPOINTS (V5.1) ---
+// =============================================================
+
+// GET /api/account/profile - Safe customer profile retrieval
+app.get('/api/account/profile', authenticate, async (req, res) => {
+  try {
+    const user = await db.users.findById(req.user.id);
+    if (!user) {
+      return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'User not found.' } });
+    }
+
+    const profile = await db.customerProfiles.findOne({ userId: req.user.id });
+
+    res.json({
+      success: true,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        phone: user.phone || '',
+        role: user.role,
+        verified: !!user.verified,
+        preferredLanguage: user.preferredLanguage || 'en',
+        preferredCurrency: user.preferredCurrency || 'OMR'
+      },
+      profile: {
+        nationality: profile ? (profile.nationality || '') : '',
+        dateOfBirth: profile ? (profile.dateOfBirth || '') : '',
+        address: profile ? (profile.address || '') : '',
+        city: profile ? (profile.city || '') : '',
+        country: profile ? (profile.country || '') : '',
+        passportNumberMasked: profile && profile.passportNumber ? maskPassport(profile.passportNumber) : null
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// PUT /api/account/profile - Safe customer profile updates with explicit allowlist
+app.put('/api/account/profile', authenticate, async (req, res) => {
+  try {
+    const user = await db.users.findById(req.user.id);
+    if (!user) {
+      return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'User not found.' } });
+    }
+
+    const body = req.body || {};
+    const bodyKeys = Object.keys(body);
+
+    const ALLOWED_USER_FIELDS = ['name', 'phone', 'preferredLanguage', 'preferredCurrency'];
+    const ALLOWED_PROFILE_FIELDS = ['nationality', 'dateOfBirth', 'address', 'city', 'country'];
+    const ALLOWED_ALL_FIELDS = [...ALLOWED_USER_FIELDS, ...ALLOWED_PROFILE_FIELDS];
+    const FORBIDDEN_FIELDS = [
+      'role', 'status', 'verified', 'passwordHash', 'password',
+      'tokenInvalidatedBefore', 'failedLoginAttempts', 'lockUntil',
+      'mfaEnabled', 'mfaSecret', 'verificationToken', 'verificationTokenExpires',
+      'resetPasswordToken', 'resetPasswordExpires', 'userId', 'id', '_id', 'passportNumber'
+    ];
+
+    // Check for unrecognized / invalid field keys
+    for (const key of bodyKeys) {
+      if (!ALLOWED_ALL_FIELDS.includes(key) && !FORBIDDEN_FIELDS.includes(key)) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'VALIDATION_ERROR', message: `Invalid field: '${key}' is not an editable profile field.` }
+        });
+      }
+    }
+
+    const userUpdates = {};
+    const profileUpdates = {};
+
+    // 1. Validate & collect User updates
+    if (body.name !== undefined) {
+      if (typeof body.name !== 'string' || body.name.trim().length < 2 || body.name.trim().length > 100) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'VALIDATION_ERROR', message: 'Name must be a valid string between 2 and 100 characters.' }
+        });
+      }
+      userUpdates.name = body.name.trim();
+    }
+
+    if (body.phone !== undefined) {
+      if (body.phone !== null && body.phone !== '') {
+        if (typeof body.phone !== 'string') {
+          return res.status(400).json({
+            success: false,
+            error: { code: 'VALIDATION_ERROR', message: 'Phone number must be a string.' }
+          });
+        }
+        const cleanPhone = body.phone.trim();
+        if (!/^[+]?[0-9\s\-()]{7,25}$/.test(cleanPhone)) {
+          return res.status(400).json({
+            success: false,
+            error: { code: 'VALIDATION_ERROR', message: 'Invalid phone number format.' }
+          });
+        }
+        userUpdates.phone = cleanPhone;
+      } else {
+        userUpdates.phone = '';
+      }
+    }
+
+    if (body.preferredLanguage !== undefined) {
+      if (typeof body.preferredLanguage !== 'string' || !['en', 'ar'].includes(body.preferredLanguage.toLowerCase().trim())) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'INVALID_LANGUAGE', message: 'Invalid preferred language. Allowed values: en, ar.' }
+        });
+      }
+      userUpdates.preferredLanguage = body.preferredLanguage.toLowerCase().trim();
+    }
+
+    if (body.preferredCurrency !== undefined) {
+      if (typeof body.preferredCurrency !== 'string' || !['OMR', 'AED', 'SAR', 'INR', 'USD'].includes(body.preferredCurrency.toUpperCase().trim())) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'INVALID_CURRENCY', message: 'Invalid preferred currency. Allowed values: OMR, AED, SAR, INR, USD.' }
+        });
+      }
+      userUpdates.preferredCurrency = body.preferredCurrency.toUpperCase().trim();
+    }
+
+    // 2. Validate & collect Profile updates
+    if (body.nationality !== undefined) {
+      if (body.nationality !== null && body.nationality !== '') {
+        if (typeof body.nationality !== 'string' || body.nationality.trim().length > 60) {
+          return res.status(400).json({
+            success: false,
+            error: { code: 'VALIDATION_ERROR', message: 'Nationality must not exceed 60 characters.' }
+          });
+        }
+        profileUpdates.nationality = body.nationality.trim();
+      } else {
+        profileUpdates.nationality = '';
+      }
+    }
+
+    if (body.dateOfBirth !== undefined) {
+      if (body.dateOfBirth !== null && body.dateOfBirth !== '') {
+        if (typeof body.dateOfBirth !== 'string') {
+          return res.status(400).json({
+            success: false,
+            error: { code: 'VALIDATION_ERROR', message: 'Date of birth must be a string in YYYY-MM-DD format.' }
+          });
+        }
+        const cleanDob = body.dateOfBirth.trim();
+        const dobParsed = Date.parse(cleanDob);
+        if (isNaN(dobParsed)) {
+          return res.status(400).json({
+            success: false,
+            error: { code: 'VALIDATION_ERROR', message: 'Invalid date of birth format.' }
+          });
+        }
+        const dobDate = new Date(dobParsed);
+        const now = new Date();
+        if (dobDate >= now) {
+          return res.status(400).json({
+            success: false,
+            error: { code: 'VALIDATION_ERROR', message: 'Date of birth must be a past date.' }
+          });
+        }
+        if (now.getFullYear() - dobDate.getFullYear() > 130) {
+          return res.status(400).json({
+            success: false,
+            error: { code: 'VALIDATION_ERROR', message: 'Invalid date of birth: age exceeds valid range.' }
+          });
+        }
+        profileUpdates.dateOfBirth = cleanDob.slice(0, 10);
+      } else {
+        profileUpdates.dateOfBirth = '';
+      }
+    }
+
+    if (body.address !== undefined) {
+      if (body.address !== null && body.address !== '') {
+        if (typeof body.address !== 'string' || body.address.trim().length > 200) {
+          return res.status(400).json({
+            success: false,
+            error: { code: 'VALIDATION_ERROR', message: 'Address must not exceed 200 characters.' }
+          });
+        }
+        profileUpdates.address = body.address.trim();
+      } else {
+        profileUpdates.address = '';
+      }
+    }
+
+    if (body.city !== undefined) {
+      if (body.city !== null && body.city !== '') {
+        if (typeof body.city !== 'string' || body.city.trim().length > 100) {
+          return res.status(400).json({
+            success: false,
+            error: { code: 'VALIDATION_ERROR', message: 'City must not exceed 100 characters.' }
+          });
+        }
+        profileUpdates.city = body.city.trim();
+      } else {
+        profileUpdates.city = '';
+      }
+    }
+
+    if (body.country !== undefined) {
+      if (body.country !== null && body.country !== '') {
+        if (typeof body.country !== 'string' || body.country.trim().length > 100) {
+          return res.status(400).json({
+            success: false,
+            error: { code: 'VALIDATION_ERROR', message: 'Country must not exceed 100 characters.' }
+          });
+        }
+        profileUpdates.country = body.country.trim();
+      } else {
+        profileUpdates.country = '';
+      }
+    }
+
+    const hasUserUpdates = Object.keys(userUpdates).length > 0;
+    const hasProfileUpdates = Object.keys(profileUpdates).length > 0;
+
+    if (!hasUserUpdates && !hasProfileUpdates) {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'VALIDATION_ERROR', message: 'At least one valid editable profile field must be provided.' }
+      });
+    }
+
+    // Apply User updates
+    let updatedUser = user;
+    if (hasUserUpdates) {
+      updatedUser = await db.users.update(req.user.id, userUpdates);
+    }
+
+    // Apply Profile updates
+    let existingProfile = await db.customerProfiles.findOne({ userId: req.user.id });
+    let updatedProfile;
+    if (existingProfile) {
+      updatedProfile = await db.customerProfiles.update(existingProfile.id, profileUpdates);
+    } else {
+      updatedProfile = await db.customerProfiles.create({
+        userId: req.user.id,
+        nationality: profileUpdates.nationality || '',
+        dateOfBirth: profileUpdates.dateOfBirth || '',
+        address: profileUpdates.address || '',
+        city: profileUpdates.city || '',
+        country: profileUpdates.country || ''
+      });
+    }
+
+    // Safe Audit Logging (contain ONLY field names, NEVER values or secrets)
+    const updatedFieldNames = [...Object.keys(userUpdates), ...Object.keys(profileUpdates)];
+    await logAudit(req, 'PROFILE_UPDATED', 'CUSTOMER_PROFILE', req.user.id, {
+      updatedFields: updatedFieldNames
+    });
+
+    res.json({
+      success: true,
+      message: 'Profile updated successfully.',
+      user: {
+        id: updatedUser.id,
+        name: updatedUser.name,
+        email: updatedUser.email,
+        phone: updatedUser.phone || '',
+        role: updatedUser.role,
+        verified: !!updatedUser.verified,
+        preferredLanguage: updatedUser.preferredLanguage || 'en',
+        preferredCurrency: updatedUser.preferredCurrency || 'OMR'
+      },
+      profile: {
+        nationality: updatedProfile ? (updatedProfile.nationality || '') : '',
+        dateOfBirth: updatedProfile ? (updatedProfile.dateOfBirth || '') : '',
+        address: updatedProfile ? (updatedProfile.address || '') : '',
+        city: updatedProfile ? (updatedProfile.city || '') : '',
+        country: updatedProfile ? (updatedProfile.country || '') : '',
+        passportNumberMasked: updatedProfile && updatedProfile.passportNumber ? maskPassport(updatedProfile.passportNumber) : null
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// --- V5.2 CUSTOMER DASHBOARD ENDPOINT ---
+app.get('/api/account/dashboard', authenticate, async (req, res) => {
+  try {
+    // Authoritative customer identity strictly from req.user.id
+    const customerId = req.user.id;
+
+    // Concurrently fetch customer's records with bounded queries and selective projection
+    const [bookingsRaw, visasRaw, ticketsRaw, inquiriesRaw, unreadNotifsCount] = await Promise.all([
+      db.tourBookings.find(
+        { userId: customerId },
+        { id: 1, bookingNumber: 1, packageTitle: 1, amount: 1, currency: 1, status: 1, travelDate: 1, createdAt: 1 },
+        { sort: { createdAt: -1 }, limit: 15, lean: true }
+      ),
+      db.visaApplications.find(
+        { userId: customerId },
+        { id: 1, applicationNumber: 1, destination: 1, visaType: 1, status: 1, travelDate: 1, requestedDocuments: 1, createdAt: 1 },
+        { sort: { createdAt: -1 }, limit: 15, lean: true }
+      ),
+      db.supportTickets.find(
+        { userId: customerId },
+        { id: 1, ticketId: 1, subject: 1, status: 1, priority: 1, createdAt: 1 },
+        { sort: { createdAt: -1 }, limit: 10, lean: true }
+      ),
+      db.contactInquiries.find(
+        { userId: customerId },
+        { id: 1, reference: 1, type: 1, status: 1, details: 1, createdAt: 1 },
+        { sort: { createdAt: -1 }, limit: 10, lean: true }
+      ),
+      db.notifications.count({ userId: customerId, read: false })
+    ]);
+
+    const bookings = Array.isArray(bookingsRaw) ? bookingsRaw : [];
+    const visas = Array.isArray(visasRaw) ? visasRaw : [];
+    const tickets = Array.isArray(ticketsRaw) ? ticketsRaw : [];
+    const inquiries = Array.isArray(inquiriesRaw) ? inquiriesRaw : [];
+
+    // Calculate Summary Metrics
+    const upcomingTrips = bookings.filter(b =>
+      ['CONFIRMED', 'PAID', 'PROCESSING', 'PENDING'].includes(b.status) &&
+      !['CANCELLED', 'REFUNDED', 'COMPLETED'].includes(b.status)
+    ).length;
+
+    const activeVisas = visas.filter(v =>
+      ['SUBMITTED', 'UNDER_REVIEW', 'ADDITIONAL_DOCUMENTS_REQUIRED', 'PROCESSING', 'PENDING_DOCUMENTS', 'APPROVED', 'Documents required'].includes(v.status) &&
+      !['CANCELLED', 'REJECTED', 'COMPLETED'].includes(v.status)
+    ).length;
+
+    const totalBookings = bookings.filter(b => b.status !== 'CANCELLED').length;
+
+    const activeTravelRequests = inquiries.filter(i =>
+      ['NEW', 'IN_REVIEW', 'CUSTOMER_ACTION_REQUIRED', 'QUOTED'].includes(i.status)
+    ).length;
+
+    const pendingActions =
+      visas.filter(v => ['ADDITIONAL_DOCUMENTS_REQUIRED', 'PENDING_DOCUMENTS', 'Documents required'].includes(v.status)).length +
+      bookings.filter(b => ['PENDING_PAYMENT', 'PAYMENT_PENDING'].includes(b.status)).length +
+      tickets.filter(t => t.status === 'WAITING_FOR_CUSTOMER').length +
+      inquiries.filter(i => i.status === 'CUSTOMER_ACTION_REQUIRED').length;
+
+    // Upcoming Activity (up to 5 items)
+    const upcomingItems = [];
+
+    bookings
+      .filter(b => ['CONFIRMED', 'PAID', 'PROCESSING', 'PENDING'].includes(b.status) && !['CANCELLED', 'REFUNDED', 'COMPLETED'].includes(b.status))
+      .forEach(b => {
+        upcomingItems.push({
+          id: b.id || b.bookingNumber,
+          type: 'TOUR_BOOKING',
+          title: b.packageTitle || 'Oman Tour Experience',
+          reference: b.bookingNumber || b.id,
+          date: b.travelDate || b.createdAt,
+          status: b.status,
+          amount: b.amount ? `${b.currency || 'OMR'} ${b.amount}` : null,
+          badgeColor: ['CONFIRMED', 'PAID'].includes(b.status) ? 'success' : 'warning'
+        });
+      });
+
+    visas
+      .filter(v => ['SUBMITTED', 'UNDER_REVIEW', 'ADDITIONAL_DOCUMENTS_REQUIRED', 'PROCESSING', 'PENDING_DOCUMENTS', 'APPROVED', 'Documents required'].includes(v.status) && !['CANCELLED', 'REJECTED', 'COMPLETED'].includes(v.status))
+      .forEach(v => {
+        upcomingItems.push({
+          id: v.id || v.applicationNumber,
+          type: 'VISA_APPLICATION',
+          title: `${v.destination} ${v.visaType} Visa`,
+          reference: v.applicationNumber || v.id,
+          date: v.travelDate || v.createdAt,
+          status: v.status,
+          amount: null,
+          badgeColor: v.status === 'APPROVED' ? 'success' : (['ADDITIONAL_DOCUMENTS_REQUIRED', 'PENDING_DOCUMENTS', 'Documents required'].includes(v.status) ? 'danger' : 'info')
+        });
+      });
+
+    const upcomingActivity = upcomingItems.slice(0, 5);
+
+    // Recent Activity (up to 5 items, sorted by date descending)
+    const recentItems = [];
+
+    bookings.forEach(b => {
+      recentItems.push({
+        id: b.id || b.bookingNumber,
+        type: 'TOUR_BOOKING',
+        title: b.packageTitle || 'Tour Reservation',
+        reference: b.bookingNumber || b.id,
+        date: b.createdAt || b.travelDate,
+        status: b.status,
+        badgeColor: ['CONFIRMED', 'PAID'].includes(b.status) ? 'success' : (b.status === 'CANCELLED' ? 'danger' : 'warning')
+      });
+    });
+
+    visas.forEach(v => {
+      recentItems.push({
+        id: v.id || v.applicationNumber,
+        type: 'VISA_APPLICATION',
+        title: `${v.destination} Visa Application`,
+        reference: v.applicationNumber || v.id,
+        date: v.createdAt,
+        status: v.status,
+        badgeColor: v.status === 'APPROVED' ? 'success' : (['CANCELLED', 'REJECTED'].includes(v.status) ? 'danger' : 'info')
+      });
+    });
+
+    tickets.forEach(t => {
+      recentItems.push({
+        id: t.id || t.ticketId,
+        type: 'SUPPORT_TICKET',
+        title: t.subject || 'Support Ticket',
+        reference: t.ticketId || t.id,
+        date: t.createdAt,
+        status: t.status,
+        badgeColor: t.status === 'RESOLVED' ? 'success' : 'info'
+      });
+    });
+
+    inquiries.forEach(i => {
+      const isHotel = i.type === 'HOTEL_INQUIRY' || i.type === 'hotel';
+      recentItems.push({
+        id: i.id || i.reference,
+        type: 'TRAVEL_REQUEST',
+        title: isHotel ? 'Hotel Consultation Request' : 'Flight Consultation Request',
+        reference: i.reference || i.id,
+        date: i.createdAt,
+        status: i.status,
+        badgeColor: ['CONFIRMED', 'QUOTED'].includes(i.status) ? 'success' : (i.status === 'CANCELLED' ? 'danger' : 'info')
+      });
+    });
+
+    recentItems.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
+    const recentActivity = recentItems.slice(0, 5);
+
+    // Sanitized Customer DTO (strictly excludes sensitive fields)
+    res.json({
+      success: true,
+      user: {
+        id: req.user.id,
+        name: req.user.name,
+        email: req.user.email,
+        phone: req.user.phone || '',
+        role: req.user.role || 'CUSTOMER',
+        verified: !!req.user.verified,
+        preferredLanguage: req.user.preferredLanguage || 'en',
+        preferredCurrency: req.user.preferredCurrency || 'OMR'
+      },
+      summary: {
+        upcomingTrips,
+        activeVisas,
+        bookings: totalBookings,
+        pendingActions,
+        pendingTravelRequests: activeTravelRequests,
+        activeTravelRequests,
+        unreadNotifications: typeof unreadNotifsCount === 'number' ? unreadNotifsCount : 0
+      },
+      upcomingActivity,
+      recentActivity
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// --- V5.3 UNIFIED MY TRIPS AGGREGATION & ENDPOINTS ---
+async function getCustomerTripsData(user) {
+  const customerId = user.id;
+
+  // Concurrent queries with bounded limits and selective projection
+  const userContacts = [user.email, user.phone].filter(Boolean);
+  const [bookingsRaw, visasRaw, documentsRaw, paymentsRaw, inquiriesRaw] = await Promise.all([
+    db.tourBookings.find(
+      { userId: customerId },
+      { id: 1, bookingNumber: 1, packageTitle: 1, travelDate: 1, amount: 1, currency: 1, status: 1, travellers: 1, travellerName: 1, createdAt: 1, updatedAt: 1 },
+      { sort: { createdAt: -1 }, limit: 25, lean: true }
+    ),
+    db.visaApplications.find(
+      { userId: customerId },
+      { id: 1, applicationNumber: 1, destination: 1, visaType: 1, travelDate: 1, passportNumber: 1, status: 1, requestedDocuments: 1, documents: 1, createdAt: 1, updatedAt: 1 },
+      { sort: { createdAt: -1 }, limit: 25, lean: true }
+    ),
+    db.visaDocuments.find(
+      { uploadedBy: customerId },
+      { id: 1, documentId: 1, applicationId: 1, documentType: 1, originalFilename: 1, displayFilename: 1, mimeType: 1, fileSize: 1, status: 1, createdAt: 1 },
+      { sort: { createdAt: -1 }, limit: 50, lean: true }
+    ),
+    db.payments.find(
+      { userId: customerId },
+      { id: 1, paymentNumber: 1, bookingId: 1, visaApplicationId: 1, amount: 1, currency: 1, status: 1, paymentMethod: 1, createdAt: 1 },
+      { sort: { createdAt: -1 }, limit: 50, lean: true }
+    ),
+    db.contactInquiries.find(
+      userContacts.length > 0
+        ? {
+            $or: [
+              { userId: customerId },
+              {
+                userId: { $in: [null, ''] },
+                type: { $nin: ['HOTEL_INQUIRY', 'FLIGHT_INQUIRY', 'hotel', 'flight'] },
+                contact: { $in: userContacts }
+              }
+            ]
+          }
+        : { userId: customerId },
+      { id: 1, reference: 1, userId: 1, type: 1, message: 1, status: 1, details: 1, staffResponse: 1, createdAt: 1, updatedAt: 1 },
+      { sort: { createdAt: -1 }, limit: 25, lean: true }
+    )
+  ]);
+
+  const bookings = Array.isArray(bookingsRaw) ? bookingsRaw : [];
+  const visas = Array.isArray(visasRaw) ? visasRaw : [];
+  const documents = Array.isArray(documentsRaw) ? documentsRaw : [];
+  const payments = Array.isArray(paymentsRaw) ? paymentsRaw : [];
+  const inquiries = Array.isArray(inquiriesRaw) ? inquiriesRaw : [];
+
+  // Index payments by bookingId and visaApplicationId
+  const paymentsByBooking = new Map();
+  const paymentsByVisa = new Map();
+  payments.forEach(p => {
+    const safePayment = {
+      id: p.id || p.paymentNumber,
+      reference: p.paymentNumber || p.id,
+      amount: p.amount,
+      currency: p.currency || 'OMR',
+      status: p.status,
+      paymentMethod: p.paymentMethod || 'Online Card Payment'
+    };
+    if (p.bookingId) paymentsByBooking.set(String(p.bookingId), safePayment);
+    if (p.visaApplicationId) paymentsByVisa.set(String(p.visaApplicationId), safePayment);
+  });
+
+  // Group sanitized documents by applicationId (no storageKey, no disk paths)
+  const docsByApp = new Map();
+  documents.forEach(d => {
+    const appId = String(d.applicationId || '');
+    if (!docsByApp.has(appId)) docsByApp.set(appId, []);
+    docsByApp.get(appId).push({
+      id: d.id || d.documentId,
+      documentId: d.documentId || d.id,
+      documentType: d.documentType,
+      filename: d.displayFilename || d.originalFilename,
+      fileSize: d.fileSize,
+      mimeType: d.mimeType,
+      status: d.status,
+      downloadUrl: `/api/documents/${d.id || d.documentId}/download`,
+      createdAt: d.createdAt
+    });
+  });
+
+  // Identify hotel/flight consultations from inquiries
+  const hotelInquiries = [];
+  const flightInquiries = [];
+  inquiries.forEach(inq => {
+    // Defense-in-depth: Strict customer isolation — never expose an inquiry owned by another registered customer
+    if (inq.userId && inq.userId !== customerId) return;
+
+    const isFlight = inq.type === 'FLIGHT_INQUIRY' || inq.type === 'flight' || (inq.reference && inq.reference.startsWith('JMT-F-')) || (inq.userId === customerId && /flight|airline|ticket|air/i.test(inq.message || ''));
+    const isHotel = inq.type === 'HOTEL_INQUIRY' || inq.type === 'hotel' || (inq.reference && inq.reference.startsWith('JMT-H-')) || (inq.userId === customerId && /hotel|resort|stay|suite|room/i.test(inq.message || ''));
+
+    // V5.5 travel requests strictly require matching customerId ownership
+    if ((isFlight || isHotel) && inq.userId !== customerId) return;
+
+    const details = inq.details || {};
+    const ref = inq.reference || inq.id;
+    let tripStatus = 'UPCOMING';
+    let nextAction = 'Concierge review in progress';
+
+    if (inq.status === 'CANCELLED' || inq.status === 'CLOSED' || inq.status === 'RESOLVED') {
+      tripStatus = 'COMPLETED';
+      nextAction = inq.status === 'CANCELLED' ? 'Request cancelled' : 'Consultation concluded';
+    } else if (inq.status === 'CUSTOMER_ACTION_REQUIRED') {
+      tripStatus = 'ACTION_REQUIRED';
+      nextAction = 'Submit requested consultation details';
+    } else if (inq.status === 'QUOTED') {
+      tripStatus = 'UPCOMING';
+      nextAction = 'Consultation quote ready for review';
+    } else if (inq.status === 'CONFIRMED') {
+      tripStatus = 'UPCOMING';
+      nextAction = 'Consultation confirmed';
+    }
+
+    if (isFlight) {
+      flightInquiries.push({
+        id: inq.id,
+        reference: ref,
+        type: 'Flight Consultation',
+        status: tripStatus,
+        rawStatus: inq.status,
+        destination: details.destination || 'International / GCC',
+        origin: details.origin || 'Muscat (MCT)',
+        startDate: details.departureDate || inq.createdAt,
+        endDate: details.returnDate || null,
+        message: (inq.message || '').slice(0, 120),
+        details,
+        nextAction,
+        createdAt: inq.createdAt
+      });
+    } else if (isHotel) {
+      hotelInquiries.push({
+        id: inq.id,
+        reference: ref,
+        type: 'Hotel Consultation',
+        status: tripStatus,
+        rawStatus: inq.status,
+        destination: details.destination || 'Oman / GCC',
+        startDate: details.checkInDate || inq.createdAt,
+        endDate: details.checkOutDate || null,
+        message: (inq.message || '').slice(0, 120),
+        details,
+        nextAction,
+        createdAt: inq.createdAt
+      });
+    }
+  });
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const trips = [];
+  const linkedVisaIds = new Set();
+  const linkedInquiryIds = new Set();
+
+  // 1. Process Tour Bookings into Trips
+  bookings.forEach(b => {
+    const payment = paymentsByBooking.get(String(b.id)) || paymentsByBooking.get(String(b.bookingNumber));
+    let paymentStatus = payment ? payment.status : (['PAID', 'CONFIRMED'].includes(b.status) ? 'PAID' : (['CANCELLED', 'REFUNDED'].includes(b.status) ? b.status : (['PENDING_PAYMENT', 'PAYMENT_PENDING'].includes(b.status) ? 'PENDING' : 'PENDING')));
+
+    // Check for a related visa application for this destination / timing
+    const linkedVisa = visas.find(v => !linkedVisaIds.has(v.id) && (
+      (v.destination && b.packageTitle && b.packageTitle.toLowerCase().includes(v.destination.toLowerCase())) ||
+      (v.travelDate && b.travelDate && v.travelDate.slice(0, 7) === b.travelDate.slice(0, 7))
+    ));
+    if (linkedVisa) linkedVisaIds.add(linkedVisa.id);
+
+    // Associated documents from linked visa
+    const tripDocs = linkedVisa ? (docsByApp.get(String(linkedVisa.id)) || docsByApp.get(String(linkedVisa.applicationNumber)) || []) : [];
+
+    // Check for consultations explicitly referencing this booking
+    const linkedHotel = hotelInquiries.find(h => h.details?.bookingId === b.id || h.details?.bookingNumber === b.bookingNumber);
+    const linkedFlight = flightInquiries.find(f => f.details?.bookingId === b.id || f.details?.bookingNumber === b.bookingNumber);
+
+    // Classification
+    let tripStatus = 'UPCOMING';
+    let nextAction = 'Ready for departure';
+
+    const hasPendingDocs = linkedVisa && (
+      ['ADDITIONAL_DOCUMENTS_REQUIRED', 'PENDING_DOCUMENTS', 'Documents required'].includes(linkedVisa.status) ||
+      (Array.isArray(linkedVisa.requestedDocuments) && linkedVisa.requestedDocuments.some(r => r.status === 'PENDING'))
+    );
+    const hasPendingPayment = ['PENDING_PAYMENT', 'PAYMENT_PENDING'].includes(b.status) || paymentStatus === 'PENDING';
+
+    if (hasPendingDocs) {
+      tripStatus = 'ACTION_REQUIRED';
+      nextAction = 'Submit requested visa documents';
+    } else if (hasPendingPayment && b.status !== 'CANCELLED') {
+      tripStatus = 'ACTION_REQUIRED';
+      nextAction = 'Complete booking payment';
+    } else if (b.status === 'CANCELLED') {
+      tripStatus = 'COMPLETED';
+      nextAction = 'Booking cancelled';
+    } else if (b.travelDate) {
+      const tDate = new Date(b.travelDate);
+      if (!isNaN(tDate.getTime())) {
+        tDate.setHours(0, 0, 0, 0);
+        if (tDate.getTime() === today.getTime()) {
+          tripStatus = 'ONGOING';
+          nextAction = 'Tour departs today';
+        } else if (tDate < today || b.status === 'COMPLETED') {
+          tripStatus = 'COMPLETED';
+          nextAction = 'Tour journey completed';
+        } else {
+          tripStatus = 'UPCOMING';
+          nextAction = b.status === 'CONFIRMED' ? 'Confirmed departure' : 'Booking confirmation pending';
+        }
+      }
+    }
+
+    // Infer destination
+    let destination = 'Muscat, Oman';
+    const titleLower = (b.packageTitle || '').toLowerCase();
+    if (titleLower.includes('salalah')) destination = 'Salalah, Oman';
+    else if (titleLower.includes('wahiba') || titleLower.includes('desert')) destination = 'Wahiba Sands, Oman';
+    else if (titleLower.includes('musandam') || titleLower.includes('khasab')) destination = 'Musandam, Oman';
+    else if (titleLower.includes('jabal') || titleLower.includes('nizwa')) destination = 'Jabal Akhdar & Nizwa, Oman';
+    else if (titleLower.includes('dubai')) destination = 'Dubai, UAE';
+
+    trips.push({
+      id: b.id || b.bookingNumber,
+      reference: b.bookingNumber || b.id,
+      type: 'TOUR',
+      title: b.packageTitle || 'Oman Tour Journey',
+      destination,
+      startDate: b.travelDate || b.createdAt,
+      endDate: null,
+      status: tripStatus,
+      paymentStatus,
+      payment: payment || { status: paymentStatus, amount: b.amount, currency: b.currency || 'OMR' },
+      nextAction,
+      services: {
+        tour: {
+          id: b.id,
+          reference: b.bookingNumber,
+          title: b.packageTitle,
+          status: b.status,
+          travellers: b.travellers || 1,
+          travellerName: b.travellerName,
+          amount: b.amount,
+          currency: b.currency || 'OMR'
+        },
+        visa: linkedVisa ? {
+          id: linkedVisa.id,
+          reference: linkedVisa.applicationNumber,
+          visaType: linkedVisa.visaType,
+          destination: linkedVisa.destination,
+          status: linkedVisa.status,
+          passportNumberMasked: maskPassport(linkedVisa.passportNumber)
+        } : null,
+        hotel: linkedHotel ? {
+          reference: linkedHotel.id,
+          type: 'Hotel Consultation',
+          status: linkedHotel.status
+        } : null,
+        flight: linkedFlight ? {
+          reference: linkedFlight.id,
+          type: 'Flight Consultation',
+          status: linkedFlight.status
+        } : null
+      },
+      documents: tripDocs,
+      createdAt: b.createdAt
+    });
+  });
+
+  // 2. Process Standalone Visa Applications into Trips
+  visas.forEach(v => {
+    if (linkedVisaIds.has(v.id)) return; // Already linked to a tour booking
+
+    const payment = paymentsByVisa.get(String(v.id)) || paymentsByVisa.get(String(v.applicationNumber));
+    let paymentStatus = payment ? payment.status : (['APPROVED', 'PROCESSING', 'UNDER_REVIEW'].includes(v.status) ? 'PAID' : (['CANCELLED', 'REJECTED'].includes(v.status) ? v.status : 'PENDING'));
+
+    const tripDocs = docsByApp.get(String(v.id)) || docsByApp.get(String(v.applicationNumber)) || [];
+
+    const linkedHotel = hotelInquiries.find(h => !linkedInquiryIds.has(h.id));
+    if (linkedHotel) linkedInquiryIds.add(linkedHotel.id);
+    const linkedFlight = flightInquiries.find(f => !linkedInquiryIds.has(f.id));
+    if (linkedFlight) linkedInquiryIds.add(linkedFlight.id);
+
+    let tripStatus = 'UPCOMING';
+    let nextAction = v.status === 'APPROVED' ? 'Visa issued — ready to travel' : 'Application under consular review';
+
+    const hasPendingDocs = ['ADDITIONAL_DOCUMENTS_REQUIRED', 'PENDING_DOCUMENTS', 'Documents required'].includes(v.status) ||
+      (Array.isArray(v.requestedDocuments) && v.requestedDocuments.some(r => r.status === 'PENDING'));
+
+    if (hasPendingDocs) {
+      tripStatus = 'ACTION_REQUIRED';
+      nextAction = 'Submit requested documents for visa clearing';
+    } else if (v.status === 'CANCELLED' || v.status === 'REJECTED') {
+      tripStatus = 'COMPLETED';
+      nextAction = v.status === 'REJECTED' ? 'Application rejected' : 'Application cancelled';
+    } else if (v.travelDate) {
+      const tDate = new Date(v.travelDate);
+      if (!isNaN(tDate.getTime())) {
+        tDate.setHours(0, 0, 0, 0);
+        if (tDate.getTime() === today.getTime()) {
+          tripStatus = 'ONGOING';
+          nextAction = 'Travel window active today';
+        } else if (tDate < today || v.status === 'COMPLETED') {
+          tripStatus = 'COMPLETED';
+          nextAction = 'Travel date passed';
+        } else {
+          tripStatus = 'UPCOMING';
+          nextAction = v.status === 'APPROVED' ? 'Visa approved — ready to travel' : 'Visa processing in progress';
+        }
+      }
+    } else if (v.status === 'COMPLETED') {
+      tripStatus = 'COMPLETED';
+      nextAction = 'Visa processing completed';
+    }
+
+    trips.push({
+      id: v.id || v.applicationNumber,
+      reference: v.applicationNumber || v.id,
+      type: 'VISA',
+      title: `${v.destination} ${v.visaType} Journey`,
+      destination: v.destination,
+      startDate: v.travelDate || v.createdAt,
+      endDate: null,
+      status: tripStatus,
+      paymentStatus,
+      payment: payment || { status: paymentStatus, amount: null, currency: 'OMR' },
+      nextAction,
+      services: {
+        tour: null,
+        visa: {
+          id: v.id,
+          reference: v.applicationNumber,
+          visaType: v.visaType,
+          destination: v.destination,
+          status: v.status,
+          passportNumberMasked: maskPassport(v.passportNumber),
+          requestedDocuments: (v.requestedDocuments || []).map(r => ({
+            requestId: r.requestId,
+            documentType: r.documentType,
+            instruction: r.instruction,
+            status: r.status
+          }))
+        },
+        hotel: null,
+        flight: null
+      },
+      documents: tripDocs,
+      createdAt: v.createdAt
+    });
+  });
+
+  // 3. Process Hotel & Flight Consultations into Unified Trips
+  [...hotelInquiries, ...flightInquiries].forEach(inq => {
+    const isFlight = inq.type === 'Flight Consultation' || inq.type === 'FLIGHT_INQUIRY' || (inq.reference && inq.reference.startsWith('JMT-F-'));
+    trips.push({
+      id: inq.id,
+      reference: inq.reference || inq.id,
+      type: isFlight ? 'FLIGHT_CONSULTATION' : 'HOTEL_CONSULTATION',
+      isConsultation: true,
+      title: isFlight
+        ? (inq.destination ? `Flight Consultation: ${inq.origin || 'MCT'} to ${inq.destination}` : 'Flight Consultation Request')
+        : (inq.destination ? `Hotel Consultation: ${inq.destination}` : 'Hotel Consultation Request'),
+      destination: inq.destination || 'Oman / GCC',
+      startDate: inq.startDate || inq.createdAt,
+      endDate: inq.endDate || null,
+      status: inq.status,
+      isConsultation: true,
+      paymentStatus: 'N/A',
+      payment: null,
+      nextAction: inq.nextAction || (inq.status === 'COMPLETED' ? 'Consultation completed' : 'Concierge review in progress'),
+      services: {
+        tour: null,
+        visa: null,
+        hotel: !isFlight ? { reference: inq.reference || inq.id, type: 'Hotel Consultation', status: inq.rawStatus || inq.status, details: inq.message } : null,
+        flight: isFlight ? { reference: inq.reference || inq.id, type: 'Flight Consultation', status: inq.rawStatus || inq.status, details: inq.message } : null
+      },
+      documents: [],
+      createdAt: inq.createdAt
+    });
+  });
+
+  // Sort all trips chronologically by start date / created date descending
+  trips.sort((a, b) => new Date(b.startDate || b.createdAt || 0) - new Date(a.startDate || a.createdAt || 0));
+
+  // Compute summary metrics
+  const summary = {
+    totalTrips: trips.length,
+    upcomingTrips: trips.filter(t => t.status === 'UPCOMING').length,
+    ongoingTrips: trips.filter(t => t.status === 'ONGOING').length,
+    completedTrips: trips.filter(t => t.status === 'COMPLETED').length,
+    actionRequired: trips.filter(t => t.status === 'ACTION_REQUIRED').length
+  };
+
+  return { summary, trips };
+}
+
+// GET /api/account/my-trips - Aggregated customer travel journeys
+app.get('/api/account/my-trips', authenticate, async (req, res) => {
+  try {
+    const allowedFilters = ['ALL', 'UPCOMING', 'ONGOING', 'ACTION_REQUIRED', 'COMPLETED'];
+    const filterStatus = req.query.status ? String(req.query.status).trim().toUpperCase() : 'ALL';
+    if (!allowedFilters.includes(filterStatus)) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'INVALID_STATUS_FILTER',
+          message: 'Status must be one of: ALL, UPCOMING, ONGOING, ACTION_REQUIRED, COMPLETED'
+        }
+      });
+    }
+
+    const { summary, trips } = await getCustomerTripsData(req.user);
+    const filteredTrips = filterStatus === 'ALL' ? trips : trips.filter(t => t.status === filterStatus);
+
+    res.json({
+      success: true,
+      summary,
+      trips: filteredTrips
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /api/account/my-trips/:id - Single trip detail for authenticated customer
+app.get('/api/account/my-trips/:id', authenticate, async (req, res) => {
+  try {
+    const targetId = String(req.params.id || '').trim();
+    if (!targetId) {
+      return res.status(400).json({ success: false, error: { code: 'INVALID_ID', message: 'Trip ID is required.' } });
+    }
+
+    const { trips } = await getCustomerTripsData(req.user);
+    const trip = trips.find(t => t.id === targetId || t.reference === targetId);
+
+    if (!trip) {
+      return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Trip not found.' } });
+    }
+
+    res.json({
+      success: true,
+      trip
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// -------------------------------------------------------------
+// V5.4 CUSTOMER VISA APPLICATIONS & SECURE DOCUMENT VAULT (Task #V5.4)
+// -------------------------------------------------------------
+
+function sanitizeDocument(doc) {
+  if (!doc) return null;
+  const d = typeof doc.toObject === 'function' ? doc.toObject() : { ...doc };
+  delete d.storageKey;
+  delete d._id;
+  delete d.__v;
+  return {
+    id: d.id || d.documentId,
+    documentId: d.documentId || d.id,
+    applicationId: d.applicationId,
+    applicationNumber: d.applicationNumber || null,
+    destination: d.destination || null,
+    documentType: d.documentType,
+    originalFilename: d.originalFilename,
+    displayFilename: d.displayFilename || d.originalFilename,
+    mimeType: d.mimeType,
+    fileSize: d.fileSize,
+    uploadedBy: d.uploadedBy,
+    status: d.status,
+    reviewNote: d.reviewNote || null,
+    replacesDocumentId: d.replacesDocumentId || null,
+    replacedByDocumentId: d.replacedByDocumentId || null,
+    downloadUrl: `/api/documents/${d.id || d.documentId}/download`,
+    createdAt: d.createdAt,
+    updatedAt: d.updatedAt
+  };
+}
+
+// GET /api/account/visa - List customer-owned visa applications
+app.get('/api/account/visa', authenticate, async (req, res) => {
+  try {
+    const rawStatus = (req.query.status || 'ALL').trim().toUpperCase();
+    const validStatuses = [
+      'ALL', 'DRAFT', 'PENDING_DOCUMENTS', 'SUBMITTED', 'UNDER_REVIEW',
+      'ADDITIONAL_DOCUMENTS_REQUIRED', 'PROCESSING', 'APPROVED', 'REJECTED',
+      'CANCELLED', 'COMPLETED'
+    ];
+
+    if (!validStatuses.includes(rawStatus)) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'INVALID_STATUS',
+          message: `Status must be one of: ${validStatuses.join(', ')}`
+        }
+      });
+    }
+
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 100);
+    const page = Math.max(parseInt(req.query.page) || 1, 1);
+
+    const filter = { userId: req.user.id };
+    if (rawStatus !== 'ALL') {
+      filter.status = rawStatus;
+    }
+
+    const allApps = await db.visaApplications.find(filter);
+    const sortedApps = allApps.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+    const total = sortedApps.length;
+    const paginatedApps = sortedApps.slice((page - 1) * limit, page * limit);
+
+    const appIds = paginatedApps.map(a => a.id);
+    const docs = appIds.length > 0 ? await db.visaDocuments.find({ applicationId: { $in: appIds } }) : [];
+    const docCountMap = new Map();
+    docs.forEach(d => {
+      docCountMap.set(d.applicationId, (docCountMap.get(d.applicationId) || 0) + 1);
+    });
+
+    const applications = paginatedApps.map(a => {
+      const obj = typeof a.toObject === 'function' ? a.toObject() : { ...a };
+      delete obj.adminNotes;
+      delete obj._id;
+      delete obj.__v;
+
+      const requestedDocs = obj.requestedDocuments || [];
+      const pendingRequests = requestedDocs.filter(r => r.status === 'PENDING');
+
+      let requiredAction = 'None';
+      if (obj.status === 'ADDITIONAL_DOCUMENTS_REQUIRED' || pendingRequests.length > 0) {
+        requiredAction = `Upload requested document (${pendingRequests.length} pending)`;
+      } else if (obj.status === 'PENDING_DOCUMENTS') {
+        requiredAction = 'Upload required documents';
+      } else if (obj.status === 'DRAFT') {
+        requiredAction = 'Complete and submit application';
+      } else if (obj.status === 'UNDER_REVIEW' || obj.status === 'PROCESSING') {
+        requiredAction = 'Consular processing in progress';
+      } else if (obj.status === 'APPROVED' || obj.status === 'COMPLETED') {
+        requiredAction = 'Ready for travel';
+      } else if (obj.status === 'REJECTED') {
+        requiredAction = 'Application closed';
+      }
+
+      return {
+        id: obj.id,
+        applicationNumber: obj.applicationNumber,
+        destination: obj.destination,
+        visaType: obj.visaType,
+        nationality: obj.nationality,
+        fullName: obj.fullName,
+        email: obj.email,
+        phone: obj.phone,
+        passportNumber: maskPassport(obj.passportNumber),
+        dateOfBirth: obj.dateOfBirth,
+        passportExpiry: obj.passportExpiry,
+        travelDate: obj.travelDate,
+        status: obj.status,
+        uploadedDocumentsCount: docCountMap.get(obj.id) || (obj.documents || []).length,
+        requiredDocumentsCount: requestedDocs.length,
+        requiredAction,
+        createdAt: obj.createdAt,
+        updatedAt: obj.updatedAt
+      };
+    });
+
+    res.json({
+      success: true,
+      page,
+      limit,
+      total,
+      count: applications.length,
+      applications
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /api/account/visa/:id - Get single visa application detail for authenticated customer
+app.get('/api/account/visa/:id', authenticate, async (req, res) => {
+  try {
+    const targetId = String(req.params.id || '').trim();
+    if (!targetId) {
+      return res.status(400).json({ success: false, error: { code: 'INVALID_ID', message: 'Application ID is required.' } });
+    }
+
+    const appRecord = await db.visaApplications.findById(targetId) || await db.visaApplications.findOne({ applicationNumber: targetId });
+    if (!appRecord) {
+      return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Visa application not found.' } });
+    }
+
+    const isStaff = ['STAFF', 'ADMIN', 'SUPER_ADMIN'].includes(req.user.role);
+    if (!isStaff && appRecord.userId !== req.user.id) {
+      await logAudit(req, 'SUSPICIOUS_IDOR_VISA_ATTEMPT', 'VISA_APPLICATION', targetId);
+      return res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Access denied: You do not own this application.' } });
+    }
+
+    const docs = await db.visaDocuments.find({ applicationId: appRecord.id });
+    const sanitizedDocs = docs.map(d => sanitizeDocument(d));
+
+    const payment = await db.payments.findOne({
+      $or: [
+        { visaApplicationId: appRecord.id },
+        { visaApplicationId: appRecord.applicationNumber }
+      ]
+    });
+
+    const safePayment = payment ? {
+      id: payment.id,
+      amount: payment.amount,
+      currency: payment.currency,
+      status: payment.status,
+      paymentMethod: payment.paymentMethod,
+      createdAt: payment.createdAt
+    } : null;
+
+    const sanitizedTimeline = (appRecord.timeline || []).map(t => ({
+      previousStatus: t.previousStatus,
+      newStatus: t.newStatus,
+      timestamp: t.timestamp,
+      note: t.note || ''
+    }));
+
+    const requestedDocs = (appRecord.requestedDocuments || []).map(r => ({
+      requestId: r.requestId,
+      documentType: r.documentType,
+      instruction: r.instruction,
+      status: r.status,
+      requestedAt: r.requestedAt
+    }));
+
+    const obj = typeof appRecord.toObject === 'function' ? appRecord.toObject() : { ...appRecord };
+    delete obj.adminNotes;
+    delete obj._id;
+    delete obj.__v;
+
+    res.json({
+      success: true,
+      application: {
+        id: obj.id,
+        applicationNumber: obj.applicationNumber,
+        destination: obj.destination,
+        visaType: obj.visaType,
+        nationality: obj.nationality,
+        fullName: obj.fullName,
+        email: obj.email,
+        phone: obj.phone,
+        passportNumber: maskPassport(obj.passportNumber),
+        dateOfBirth: obj.dateOfBirth,
+        passportExpiry: obj.passportExpiry,
+        travelDate: obj.travelDate,
+        status: obj.status,
+        timeline: sanitizedTimeline,
+        documents: sanitizedDocs,
+        requestedDocuments: requestedDocs,
+        payment: safePayment,
+        createdAt: obj.createdAt,
+        updatedAt: obj.updatedAt
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /api/account/documents - List customer-owned documents in Document Vault
+app.get('/api/account/documents', authenticate, async (req, res) => {
+  try {
+    const rawType = (req.query.type || 'ALL').trim().toUpperCase();
+    const validTypes = ['ALL', 'PASSPORT_COPY', 'PHOTO', 'CIVIL_ID', 'TRAVEL_ITINERARY', 'OTHER'];
+    if (!validTypes.includes(rawType)) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'INVALID_DOCUMENT_TYPE',
+          message: `Document type must be one of: ${validTypes.join(', ')}`
+        }
+      });
+    }
+
+    const rawStatus = (req.query.status || 'ALL').trim().toUpperCase();
+    const validStatuses = ['ALL', 'UPLOADED', 'UNDER_REVIEW', 'ACCEPTED', 'REJECTED', 'REPLACED'];
+    if (!validStatuses.includes(rawStatus)) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'INVALID_STATUS',
+          message: `Status must be one of: ${validStatuses.join(', ')}`
+        }
+      });
+    }
+
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 100);
+    const page = Math.max(parseInt(req.query.page) || 1, 1);
+
+    const userApps = await db.visaApplications.find({ userId: req.user.id });
+    const appMap = new Map();
+    userApps.forEach(a => {
+      appMap.set(a.id, a);
+      if (a.applicationNumber) appMap.set(a.applicationNumber, a);
+    });
+    const appIds = userApps.map(a => a.id);
+
+    const filter = {
+      $or: [
+        { uploadedBy: req.user.id },
+        { applicationId: { $in: appIds } }
+      ]
+    };
+
+    if (rawType !== 'ALL') {
+      filter.documentType = rawType;
+    }
+    if (rawStatus !== 'ALL') {
+      filter.status = rawStatus;
+    }
+
+    const allDocs = await db.visaDocuments.find(filter);
+    const sortedDocs = allDocs.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+    const total = sortedDocs.length;
+    const paginatedDocs = sortedDocs.slice((page - 1) * limit, page * limit);
+
+    const documents = paginatedDocs.map(d => {
+      const sanitized = sanitizeDocument(d);
+      const app = appMap.get(sanitized.applicationId);
+      if (app) {
+        sanitized.applicationNumber = app.applicationNumber || app.id;
+        sanitized.destination = app.destination || null;
+      }
+      return sanitized;
+    });
+
+    res.json({
+      success: true,
+      page,
+      limit,
+      total,
+      count: documents.length,
+      documents
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /api/account/documents/:id - Single document metadata for authenticated customer
+app.get('/api/account/documents/:id', authenticate, async (req, res) => {
+  try {
+    const targetId = String(req.params.id || '').trim();
+    if (!targetId) {
+      return res.status(400).json({ success: false, error: { code: 'INVALID_ID', message: 'Document ID is required.' } });
+    }
+
+    const docRecord = await db.visaDocuments.findById(targetId) || await db.visaDocuments.findOne({ documentId: targetId });
+    if (!docRecord) {
+      return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Document not found.' } });
+    }
+
+    const appRecord = await db.visaApplications.findById(docRecord.applicationId) || await db.visaApplications.findOne({ applicationNumber: docRecord.applicationId });
+    const isStaff = ['STAFF', 'ADMIN', 'SUPER_ADMIN'].includes(req.user.role);
+    const isOwner = docRecord.uploadedBy === req.user.id || (appRecord && appRecord.userId === req.user.id);
+
+    if (!isStaff && !isOwner) {
+      await logAudit(req, 'SUSPICIOUS_IDOR_DOCUMENT_VIEW_ATTEMPT', 'VISA_DOCUMENT', targetId);
+      return res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Access denied: You do not own this document.' } });
+    }
+
+    const sanitized = sanitizeDocument(docRecord);
+    if (appRecord) {
+      sanitized.applicationNumber = appRecord.applicationNumber || appRecord.id;
+      sanitized.destination = appRecord.destination || null;
+    }
+
+    res.json({
+      success: true,
+      document: sanitized
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// -------------------------------------------------------------
+// V5.5 CUSTOMER TRAVEL REQUESTS (HOTEL & FLIGHT INQUIRIES)
+// -------------------------------------------------------------
+
+function formatCustomerTravelRequestDTO(inquiry) {
+  if (!inquiry) return null;
+  const inq = typeof inquiry.toObject === 'function' ? inquiry.toObject() : { ...inquiry };
+  const isHotel = inq.type === 'HOTEL_INQUIRY' || inq.type === 'hotel';
+  const isFlight = inq.type === 'FLIGHT_INQUIRY' || inq.type === 'flight';
+  const details = inq.details || {};
+
+  // Customer-facing status timeline (Current request lifecycle derived from current inquiry status
+  // and real document timestamps; milestones reflect current status, NOT an audit event history log)
+  const timeline = [
+    {
+      status: 'SUBMITTED',
+      title: 'Consultation Request Submitted',
+      description: 'Your travel inquiry has been received by the JMT Concierge Desk.',
+      timestamp: inq.createdAt
+    }
+  ];
+
+  if (inq.status === 'IN_REVIEW') {
+    timeline.push({
+      status: 'IN_REVIEW',
+      title: 'Under Concierge Review',
+      description: 'A JMT travel specialist is reviewing accommodation / flight route availability and negotiated rates.',
+      timestamp: inq.updatedAt || inq.createdAt
+    });
+  } else if (inq.status === 'CUSTOMER_ACTION_REQUIRED') {
+    timeline.push({
+      status: 'CUSTOMER_ACTION_REQUIRED',
+      title: 'Customer Details Required',
+      description: inq.staffResponse || 'JMT travel specialist requires additional preferences or date confirmation.',
+      timestamp: inq.updatedAt || inq.createdAt
+    });
+  } else if (inq.status === 'QUOTED') {
+    timeline.push({
+      status: 'QUOTED',
+      title: 'Consultation Options Prepared',
+      description: inq.staffResponse || 'Custom itinerary and fare options are ready for your review.',
+      timestamp: inq.updatedAt || inq.createdAt
+    });
+  } else if (inq.status === 'CONFIRMED') {
+    timeline.push({
+      status: 'CONFIRMED',
+      title: 'Consultation Confirmed',
+      description: 'Consultation confirmed with JMT travel desk.',
+      timestamp: inq.updatedAt || inq.createdAt
+    });
+  } else if (inq.status === 'CANCELLED') {
+    timeline.push({
+      status: 'CANCELLED',
+      title: 'Request Cancelled',
+      description: 'This travel request was cancelled by customer.',
+      timestamp: inq.updatedAt || inq.createdAt
+    });
+  } else if (inq.status === 'CLOSED' || inq.status === 'RESOLVED') {
+    timeline.push({
+      status: 'COMPLETED',
+      title: 'Consultation Concluded',
+      description: 'This consultation request has been concluded.',
+      timestamp: inq.updatedAt || inq.createdAt
+    });
+  }
+
+  let nextAction = 'JMT team will verify availability and reach out with consultation options';
+  if (inq.status === 'CUSTOMER_ACTION_REQUIRED') {
+    nextAction = 'Action Required: Please provide requested information via WhatsApp or reply to JMT';
+  } else if (inq.status === 'QUOTED') {
+    nextAction = 'Review consultation quote with your JMT travel consultant';
+  } else if (inq.status === 'CONFIRMED') {
+    nextAction = 'Consultation confirmed — preparation for itinerary handover';
+  } else if (inq.status === 'CANCELLED') {
+    nextAction = 'Request cancelled';
+  } else if (inq.status === 'CLOSED' || inq.status === 'RESOLVED') {
+    nextAction = 'Consultation completed';
+  }
+
+  // Sanitized details (strictly excluding internal staff notes, storage paths, passwords, payment secrets)
+  const sanitizedDetails = { ...details };
+  delete sanitizedDetails.adminNotes;
+  delete sanitizedDetails.internalNotes;
+  delete sanitizedDetails.staffNotes;
+  delete sanitizedDetails.storageKey;
+  delete sanitizedDetails.filePath;
+  delete sanitizedDetails.diskPath;
+
+  return {
+    id: inq.id,
+    reference: inq.reference || inq.id,
+    type: inq.type,
+    category: isHotel ? 'HOTEL' : (isFlight ? 'FLIGHT' : 'GENERAL'),
+    status: inq.status,
+    title: isHotel
+      ? (details.preferredHotel ? `Hotel Consultation: ${details.preferredHotel}` : `Hotel Consultation: ${details.destination || 'Oman'}`)
+      : (isFlight ? `Flight Consultation: ${details.origin || 'MCT'} → ${details.destination || 'DXB'}` : 'Travel Consultation Request'),
+    destination: details.destination || 'Oman / GCC',
+    origin: isFlight ? (details.origin || 'Muscat (MCT)') : null,
+    startDate: details.checkInDate || details.departureDate || inq.createdAt,
+    endDate: details.checkOutDate || details.returnDate || null,
+    guestCount: isHotel
+      ? { adults: details.adults || 1, children: details.children || 0, rooms: details.rooms || 1 }
+      : null,
+    passengerCount: isFlight
+      ? { adults: details.adults || 1, children: details.children || 0, infants: details.infants || 0 }
+      : null,
+    details: sanitizedDetails,
+    staffResponse: inq.staffResponse || null,
+    nextAction,
+    timeline,
+    supportContact: {
+      phone: '+968 9760 8999',
+      whatsappUrl: `https://wa.me/96897608999?text=${encodeURIComponent(`Travel Inquiry Ref: ${inq.reference || inq.id}`)}`,
+      email: 'info@jmttravels.com'
+    },
+    createdAt: inq.createdAt,
+    updatedAt: inq.updatedAt
+  };
+}
+
+// POST /api/account/travel-requests - Authenticated customer travel inquiry submission
+app.post('/api/account/travel-requests', authenticate, submissionLimiter, async (req, res) => {
+  try {
+    // SECURITY: Always derive userId strictly from authenticated session
+    const userId = req.user.id;
+
+    const payload = req.body || {};
+    const rawType = String(payload.type || '').trim().toUpperCase();
+    const typeMapping = {
+      'HOTEL': 'HOTEL_INQUIRY',
+      'HOTEL_INQUIRY': 'HOTEL_INQUIRY',
+      'FLIGHT': 'FLIGHT_INQUIRY',
+      'FLIGHT_INQUIRY': 'FLIGHT_INQUIRY'
+    };
+    const inquiryType = typeMapping[rawType];
+    if (!inquiryType) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'INVALID_INQUIRY_TYPE',
+          message: 'Inquiry type must be HOTEL_INQUIRY or FLIGHT_INQUIRY'
+        }
+      });
+    }
+
+    // Common sanitization helper
+    const sanitizeStr = (val, maxLen = 200) => typeof val === 'string' ? val.trim().slice(0, maxLen) : '';
+
+    const destination = sanitizeStr(payload.destination, 120);
+    if (!destination || destination.length < 2) {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'VALIDATION_ERROR', message: 'Destination is required (minimum 2 characters).' }
+      });
+    }
+
+    const todayDateStr = new Date().toISOString().split('T')[0];
+    const isValidDate = (dStr) => /^\d{4}-\d{2}-\d{2}$/.test(dStr) && !isNaN(new Date(dStr).getTime());
+
+    let validatedDetails = {};
+    let summaryMessage = '';
+    let refPrefix = 'JMT-';
+
+    if (inquiryType === 'HOTEL_INQUIRY') {
+      refPrefix = 'JMT-H-';
+      const checkInDate = sanitizeStr(payload.checkInDate, 10);
+      const checkOutDate = sanitizeStr(payload.checkOutDate, 10);
+
+      if (!checkInDate || !isValidDate(checkInDate)) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'INVALID_CHECKIN_DATE', message: 'Valid check-in date (YYYY-MM-DD) is required.' }
+        });
+      }
+      if (checkInDate < todayDateStr) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'PAST_TRAVEL_DATE', message: 'Check-in date cannot be in the past.' }
+        });
+      }
+      if (!checkOutDate || !isValidDate(checkOutDate)) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'INVALID_CHECKOUT_DATE', message: 'Valid check-out date (YYYY-MM-DD) is required.' }
+        });
+      }
+      if (checkOutDate < checkInDate) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'INVALID_DATE_ORDER', message: 'Check-out date must be on or after check-in date.' }
+        });
+      }
+
+      const adults = parseInt(payload.adults, 10);
+      if (isNaN(adults) || adults < 1 || adults > 20) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'INVALID_GUEST_COUNT', message: 'Adults must be between 1 and 20.' }
+        });
+      }
+      const children = parseInt(payload.children, 10) || 0;
+      if (children < 0 || children > 20) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'INVALID_GUEST_COUNT', message: 'Children count must be between 0 and 20.' }
+        });
+      }
+      const rooms = parseInt(payload.rooms, 10) || 1;
+      if (rooms < 1 || rooms > 10) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'INVALID_ROOM_COUNT', message: 'Rooms must be between 1 and 10.' }
+        });
+      }
+
+      validatedDetails = {
+        destination,
+        checkInDate,
+        checkOutDate,
+        adults,
+        children,
+        rooms,
+        preferredHotel: sanitizeStr(payload.preferredHotel, 150),
+        roomPreference: sanitizeStr(payload.roomPreference, 100),
+        budgetRange: sanitizeStr(payload.budgetRange, 80),
+        specialRequirements: sanitizeStr(payload.specialRequirements, 1000),
+        contactPreference: sanitizeStr(payload.contactPreference, 60) || 'WHATSAPP'
+      };
+
+      summaryMessage = `Hotel Inquiry: ${validatedDetails.preferredHotel || destination} (${checkInDate} to ${checkOutDate}, ${rooms} room(s), ${adults} adult(s)${children ? `, ${children} child(ren)` : ''})`;
+    } else {
+      // FLIGHT_INQUIRY
+      refPrefix = 'JMT-F-';
+      const origin = sanitizeStr(payload.origin, 120);
+      if (!origin || origin.length < 2) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'VALIDATION_ERROR', message: 'Origin is required (minimum 2 characters).' }
+        });
+      }
+      if (origin.toLowerCase() === destination.toLowerCase()) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'SAME_ORIGIN_DESTINATION', message: 'Origin and destination cannot be identical.' }
+        });
+      }
+
+      const departureDate = sanitizeStr(payload.departureDate, 10);
+      if (!departureDate || !isValidDate(departureDate)) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'INVALID_DEPARTURE_DATE', message: 'Valid departure date (YYYY-MM-DD) is required.' }
+        });
+      }
+      if (departureDate < todayDateStr) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'PAST_TRAVEL_DATE', message: 'Departure date cannot be in the past.' }
+        });
+      }
+
+      const tripType = ['round-trip', 'one-way', 'multi-city'].includes(payload.tripType) ? payload.tripType : 'round-trip';
+      let returnDate = null;
+      if (tripType === 'round-trip') {
+        returnDate = sanitizeStr(payload.returnDate, 10);
+        if (!returnDate || !isValidDate(returnDate)) {
+          return res.status(400).json({
+            success: false,
+            error: { code: 'INVALID_RETURN_DATE', message: 'Valid return date (YYYY-MM-DD) is required for round trips.' }
+          });
+        }
+        if (returnDate < departureDate) {
+          return res.status(400).json({
+            success: false,
+            error: { code: 'INVALID_DATE_ORDER', message: 'Return date must be on or after departure date.' }
+          });
+        }
+      }
+
+      const adults = parseInt(payload.adults, 10);
+      if (isNaN(adults) || adults < 1 || adults > 20) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'INVALID_PASSENGER_COUNT', message: 'Adults must be between 1 and 20.' }
+        });
+      }
+      const children = parseInt(payload.children, 10) || 0;
+      if (children < 0 || children > 20) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'INVALID_PASSENGER_COUNT', message: 'Children count must be between 0 and 20.' }
+        });
+      }
+      const infants = parseInt(payload.infants, 10) || 0;
+      if (infants < 0 || infants > 10) {
+        return res.status(400).json({
+          success: false,
+          error: { code: 'INVALID_PASSENGER_COUNT', message: 'Infants count must be between 0 and 10.' }
+        });
+      }
+
+      validatedDetails = {
+        origin,
+        destination,
+        tripType,
+        departureDate,
+        returnDate,
+        adults,
+        children,
+        infants,
+        preferredCabin: sanitizeStr(payload.preferredCabin, 50) || 'Economy',
+        preferredAirline: sanitizeStr(payload.preferredAirline, 100),
+        specialRequirements: sanitizeStr(payload.specialRequirements, 1000),
+        contactPreference: sanitizeStr(payload.contactPreference, 60) || 'WHATSAPP'
+      };
+
+      summaryMessage = `Flight Inquiry: ${origin} to ${destination} (${tripType}, ${departureDate}${returnDate ? ` to ${returnDate}` : ''}, ${adults} adult(s)${children ? `, ${children} child(ren)` : ''})`;
+    }
+
+    const reference = `${refPrefix}${Math.floor(100000 + Math.random() * 900000)}`;
+    const inquiryId = `inq_${crypto.randomUUID()}`;
+
+    const newInquiry = await db.contactInquiries.create({
+      id: inquiryId,
+      reference,
+      userId,
+      name: req.user.name,
+      contact: req.user.email || req.user.phone || 'customer@jmttravels.com',
+      type: inquiryType,
+      status: 'NEW',
+      message: summaryMessage,
+      details: validatedDetails,
+      staffResponse: '',
+      adminNotes: ''
+    });
+
+    await logAudit(req, 'CREATE_TRAVEL_REQUEST', 'CONTACT_INQUIRY', newInquiry.id, {
+      reference,
+      type: inquiryType,
+      destination: validatedDetails.destination
+    });
+
+    // Dispatch customer notification (Failure Isolated)
+    const eventName = inquiryType === 'HOTEL_INQUIRY' ? 'HOTEL_INQUIRY_CREATED' : 'FLIGHT_INQUIRY_CREATED';
+    await notificationService.dispatchEvent(eventName, {
+      user: req.user,
+      reference,
+      destination: validatedDetails.destination,
+      entityType: 'CONTACT_INQUIRY',
+      entityId: newInquiry.id,
+      actionUrl: '/account/travel-requests',
+      idempotencyKey: `inquiry_created:${newInquiry.id}`
+    });
+
+    const inqDto = formatCustomerTravelRequestDTO(newInquiry);
+    res.status(201).json({
+      success: true,
+      message: 'Travel inquiry submitted successfully. JMT team will review availability and contact you.',
+      request: inqDto,
+      inquiry: inqDto
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /api/account/travel-requests - List customer's own travel inquiries
+app.get('/api/account/travel-requests', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { type, status } = req.query || {};
+
+    const filter = { userId };
+    if (type && type !== 'ALL') {
+      const typeUpper = String(type).trim().toUpperCase();
+      if (['HOTEL', 'HOTEL_INQUIRY'].includes(typeUpper)) {
+        filter.type = { $in: ['HOTEL_INQUIRY', 'hotel'] };
+      } else if (['FLIGHT', 'FLIGHT_INQUIRY'].includes(typeUpper)) {
+        filter.type = { $in: ['FLIGHT_INQUIRY', 'flight'] };
+      }
+    }
+    if (status && status !== 'ALL') {
+      filter.status = String(status).trim().toUpperCase();
+    }
+
+    const inquiries = await db.contactInquiries.find(filter, null, { sort: { createdAt: -1 } });
+    const formatted = (Array.isArray(inquiries) ? inquiries : []).map(formatCustomerTravelRequestDTO);
+
+    res.json({
+      success: true,
+      count: formatted.length,
+      requests: formatted,
+      inquiries: formatted
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /api/account/travel-requests/:id - Single travel request detail with IDOR defense
+app.get('/api/account/travel-requests/:id', authenticate, async (req, res) => {
+  try {
+    const targetId = String(req.params.id || '').trim();
+    if (!targetId) {
+      return res.status(400).json({ success: false, error: { code: 'INVALID_ID', message: 'Inquiry ID is required.' } });
+    }
+
+    const inquiry = await db.contactInquiries.findOne({
+      $or: [{ id: targetId }, { reference: targetId }]
+    }) || await db.contactInquiries.findById(targetId);
+
+    if (!inquiry) {
+      return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Travel request not found.' } });
+    }
+
+    const isStaff = ['STAFF', 'ADMIN', 'SUPER_ADMIN'].includes(req.user.role);
+    if (!isStaff && inquiry.userId !== req.user.id) {
+      await logAudit(req, 'SUSPICIOUS_IDOR_TRAVEL_REQUEST_VIEW_ATTEMPT', 'CONTACT_INQUIRY', targetId);
+      return res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Access denied: You do not own this travel request.' } });
+    }
+
+    const inqDto = formatCustomerTravelRequestDTO(inquiry);
+    res.json({
+      success: true,
+      request: inqDto,
+      inquiry: inqDto
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// PATCH /api/account/travel-requests/:id/cancel - Customer cancellation of own pending request
+app.patch('/api/account/travel-requests/:id/cancel', authenticate, async (req, res) => {
+  try {
+    const targetId = String(req.params.id || '').trim();
+    if (!targetId) {
+      return res.status(400).json({ success: false, error: { code: 'INVALID_ID', message: 'Inquiry ID is required.' } });
+    }
+
+    const inquiry = await db.contactInquiries.findOne({
+      $or: [{ id: targetId }, { reference: targetId }]
+    }) || await db.contactInquiries.findById(targetId);
+
+    if (!inquiry) {
+      return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Travel request not found.' } });
+    }
+
+    const isStaff = ['STAFF', 'ADMIN', 'SUPER_ADMIN'].includes(req.user.role);
+    if (!isStaff && inquiry.userId !== req.user.id) {
+      await logAudit(req, 'SUSPICIOUS_IDOR_TRAVEL_REQUEST_CANCEL_ATTEMPT', 'CONTACT_INQUIRY', targetId);
+      return res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Access denied: You do not own this travel request.' } });
+    }
+
+    if (['CANCELLED', 'CLOSED', 'RESOLVED'].includes(inquiry.status)) {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'REQUEST_ALREADY_CLOSED', message: 'Travel request is already closed or cancelled.' }
+      });
+    }
+
+    const updated = await db.contactInquiries.update(inquiry.id, {
+      status: 'CANCELLED',
+      staffResponse: inquiry.staffResponse ? `${inquiry.staffResponse}\n[Customer cancelled request]` : '[Customer cancelled request]'
+    });
+
+    await logAudit(req, 'CANCEL_TRAVEL_REQUEST', 'CONTACT_INQUIRY', inquiry.id, {
+      reference: inquiry.reference,
+      type: inquiry.type
+    });
+
+    const updatedDto = formatCustomerTravelRequestDTO(updated);
+    res.json({
+      success: true,
+      message: 'Travel request has been successfully cancelled.',
+      request: updatedDto,
+      inquiry: updatedDto
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// --- i18n & MULTI-CURRENCY ENDPOINTS (Task #7) ---
+app.get('/api/i18n/translations', (req, res) => {
+  const translations = i18nService.getTranslations(req.locale);
+  res.json({
+    success: true,
+    data: translations
+  });
+});
+
+app.get('/api/i18n/currencies', (req, res) => {
+  res.json({
+    success: true,
+    data: i18nService.getCurrencyConfigs()
+  });
+});
+
+app.post('/api/i18n/format-currency', (req, res) => {
+  const { amountMinor, currency, locale } = req.body || {};
+  
+  if (typeof amountMinor !== 'number') {
+    return res.status(400).json({
+      success: false,
+      error: { code: 'VALIDATION_ERROR', message: 'amountMinor (integer) is required.' }
+    });
+  }
+
+  const targetCurrency = currency ? currency.toUpperCase() : req.currency;
+  const targetLocale = locale ? locale.toLowerCase() : req.locale;
+
+  if (!i18nService.isSupportedCurrency(targetCurrency)) {
+    return res.status(400).json({
+      success: false,
+      error: { code: 'INVALID_CURRENCY', message: 'Unsupported currency requested.' }
+    });
+  }
+
+  if (!i18nService.isSupportedLocale(targetLocale)) {
+    return res.status(400).json({
+      success: false,
+      error: { code: 'INVALID_LOCALE', message: 'Unsupported locale requested.' }
+    });
+  }
+
+  const formatted = i18nService.formatCurrency(amountMinor, targetCurrency, targetLocale);
+
+  res.json({
+    success: true,
+    amountMinor,
+    currency: targetCurrency,
+    locale: targetLocale,
+    formatted
+  });
+});
+
+app.get('/api/i18n/fx-rates', (req, res) => {
+  const { base = 'OMR', quote = 'OMR', amountMinor = 1000 } = req.query;
+
+  if (!i18nService.isSupportedCurrency(base) || !i18nService.isSupportedCurrency(quote)) {
+    return res.status(400).json({
+      success: false,
+      error: { code: 'INVALID_CURRENCY', message: 'Unsupported base or quote currency.' }
+    });
+  }
+
+  const numericAmount = parseInt(amountMinor, 10) || 1000;
+  const conversion = i18nService.fxProvider.convert(numericAmount, base, quote);
+
+  res.json({
+    success: true,
+    status: 'PREPARED_ONLY',
+    notice: 'Display estimates only. Payment amounts remain server-authoritative in base currency.',
+    data: conversion
+  });
+});
+
+// MFA VERIFICATION ARCHITECTURE INTERFACE (PREPARED ONLY - Task #2 Section 13)
+app.post('/api/auth/mfa/verify', authLimiter, async (req, res) => {
+  const { code } = req.body || {};
+  if (!code) {
+    return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'MFA verification code is required.' } });
+  }
+  // Architecture interface prepared for TOTP/WebAuthn
+  res.status(501).json({ success: false, error: { code: 'MFA_NOT_CONFIGURED', message: 'MFA verification interface is prepared but TOTP provider is unconfigured.' } });
+});
+
+// ADMIN ROLE MANAGEMENT (SUPER_ADMIN ONLY - Task #2 Section 17)
+app.patch('/api/users/:id/role', authenticate, authorize('SUPER_ADMIN'), async (req, res) => {
+  const { role } = req.body || {};
+  const validRoles = ['CUSTOMER', 'STAFF', 'ADMIN', 'SUPER_ADMIN'];
+  if (!validRoles.includes(role)) {
+    return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Invalid role.' } });
+  }
+
+  const user = await db.users.findById(req.params.id);
+  if (!user) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'User not found.' } });
+
+  const updated = await db.users.update(user.id, { role });
+  await logAudit(req, `Role updated to ${role}`, 'USER', user.id);
+  res.json({ success: true, user: sanitizeUser(updated) });
+});
+
+// Require Visa, Tourism & Storage Services
+const visaService = require('./services/visa');
+const tourismService = require('./services/tourism');
+const { storageService, FileSecurityService } = require('./services/storage');
+
+// Memory storage for file upload processing & signature verification
+const memoryUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 } // 10MB Limit
+});
+
+// --- 3. VISA SERVICES & APPLICATIONS (IDOR & STATE TRANSITION MATRIX ENFORCED) ---
+app.get('/api/visa/services', async (req, res) => {
+  const cacheKey = `visa:services:${req.locale}`;
+  const cached = cache.get(cacheKey);
+  if (cached) {
+    res.setHeader('Cache-Control', 'public, max-age=60');
+    return res.json(cached);
+  }
+  const services = await db.visaServices.find({ published: true });
+  const response = { success: true, services };
+  cache.set(cacheKey, response, 60, ['visa']);
+  res.setHeader('Cache-Control', 'public, max-age=60');
+  res.json(response);
+});
+
+app.get('/api/visa/services/:slug', async (req, res) => {
+  const service = await db.visaServices.findOne({ slug: req.params.slug });
+  if (!service) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Visa service not found.' } });
+  res.json({ success: true, service });
+});
+
+app.post('/api/visa/applications', optionalAuth, submissionLimiter, async (req, res) => {
+  try {
+    const { website } = req.body || {};
+    if (website) return res.json({ success: true, reference: 'JMT-V-SPAM' });
+
+    const appRecord = await visaService.createApplication(req.body, req.user);
+    res.status(201).json({
+      success: true,
+      reference: appRecord.applicationNumber,
+      status: appRecord.status,
+      application: visaService.sanitizeApplication(appRecord, req.user ? req.user.role : 'GUEST'),
+      message: appRecord.status === 'DRAFT' ? 'Draft application saved.' : 'Your visa application has been received.'
+    });
+  } catch (err) {
+    res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: err.message } });
+  }
+});
+
+app.get('/api/visa/applications', authenticate, async (req, res) => {
+  const isStaff = ['STAFF', 'ADMIN', 'SUPER_ADMIN'].includes(req.user.role);
+  const filter = isStaff ? {} : { userId: req.user.id };
+  const rawApps = await db.visaApplications.find(filter);
+  const applications = rawApps.map(a => visaService.sanitizeApplication(a, req.user.role));
+  res.json({ success: true, applications });
+});
+
+// IDOR RESTRICTED APPLICATION DETAIL (Task #3 Section 15 & 22)
+app.get('/api/visa/applications/:id', authenticate, async (req, res) => {
+  const appRecord = await db.visaApplications.findById(req.params.id) || await db.visaApplications.findOne({ applicationNumber: req.params.id });
+  if (!appRecord) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Application not found.' } });
+
+  const isStaff = ['STAFF', 'ADMIN', 'SUPER_ADMIN'].includes(req.user.role);
+  if (!isStaff && appRecord.userId !== req.user.id) {
+    await logAudit(req, 'SUSPICIOUS_IDOR_ATTEMPT', 'VISA_APPLICATION', req.params.id);
+    return res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Access denied: You do not own this application.' } });
+  }
+  res.json({ success: true, application: visaService.sanitizeApplication(appRecord, req.user.role) });
+});
+
+// SERVER-CONTROLLED STATE TRANSITION (Task #3 Section 5)
+app.patch('/api/visa/applications/:id/status', authenticate, async (req, res) => {
+  try {
+    const { status, note } = req.body || {};
+    const updated = await visaService.transitionStatus(req.params.id, status, req.user, note);
+    await logAudit(req, `Changed visa status to ${status}`, 'VISA_APPLICATION', req.params.id);
+    res.json({ success: true, application: visaService.sanitizeApplication(updated, req.user.role) });
+  } catch (err) {
+    res.status(400).json({ success: false, error: { code: 'TRANSITION_ERROR', message: err.message } });
+  }
+});
+
+// REQUEST ADDITIONAL DOCUMENTS (STAFF/ADMIN ONLY - Task #3 Section 19)
+app.post('/api/visa/applications/:id/request-documents', authenticate, authorize('STAFF', 'ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const { documentType, instruction } = req.body || {};
+    if (!documentType) return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Document type is required.' } });
+    
+    const requestItem = await visaService.requestAdditionalDocuments(req.params.id, documentType, instruction, req.user);
+    await logAudit(req, `Requested additional document: ${documentType}`, 'VISA_APPLICATION', req.params.id);
+    res.status(201).json({ success: true, request: requestItem });
+  } catch (err) {
+    res.status(400).json({ success: false, error: { code: 'REQUEST_ERROR', message: err.message } });
+  }
+});
+
+// --- 4. SECURE PRIVATE FILE UPLOADS, REVIEW & DOWNLOADS (Task #3 Section 8–16 & V5.4) ---
+app.post('/api/documents/upload', authenticate, uploadLimiter, memoryUpload.single('document'), async (req, res) => {
+  try {
+    if (!req.file || req.file.size === 0) {
+      return res.status(400).json({ success: false, error: { code: 'NO_FILE', message: 'Please select a valid, non-empty document file to upload.' } });
+    }
+
+    if (req.file.originalname && req.file.originalname.length > 255) {
+      return res.status(400).json({ success: false, error: { code: 'FILENAME_TOO_LONG', message: 'Filename exceeds maximum length of 255 characters.' } });
+    }
+
+    const { applicationId, documentType } = req.body || {};
+    if (!applicationId) {
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Application ID is required for document upload.' } });
+    }
+
+    const isStaff = ['STAFF', 'ADMIN', 'SUPER_ADMIN'].includes(req.user.role);
+    const appRecord = await db.visaApplications.findById(applicationId) || await db.visaApplications.findOne({ applicationNumber: applicationId });
+    if (!appRecord) {
+      return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Visa application not found.' } });
+    }
+
+    if (!isStaff && appRecord.userId !== req.user.id) {
+      await logAudit(req, 'SUSPICIOUS_IDOR_DOCUMENT_UPLOAD_ATTEMPT', 'VISA_APPLICATION', applicationId);
+      return res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Access denied: You do not own this application.' } });
+    }
+
+    const docRecord = await visaService.uploadDocument(
+      req.file.buffer,
+      req.file.originalname,
+      req.file.mimetype,
+      applicationId,
+      documentType,
+      req.user
+    );
+
+    await logAudit(req, `Uploaded document: ${docRecord.documentType}`, 'VISA_DOCUMENT', docRecord.id);
+    res.status(201).json({ success: true, document: sanitizeDocument(docRecord) });
+  } catch (err) {
+    res.status(400).json({ success: false, error: { code: 'UPLOAD_ERROR', message: err.message } });
+  }
+});
+
+// SAFE DOCUMENT REPLACEMENT (Section 13A)
+app.post('/api/documents/:id/replace', authenticate, uploadLimiter, memoryUpload.single('document'), async (req, res) => {
+  try {
+    if (!req.file || req.file.size === 0) {
+      return res.status(400).json({ success: false, error: { code: 'NO_FILE', message: 'Please select a valid, non-empty replacement file.' } });
+    }
+
+    if (req.file.originalname && req.file.originalname.length > 255) {
+      return res.status(400).json({ success: false, error: { code: 'FILENAME_TOO_LONG', message: 'Filename exceeds maximum length of 255 characters.' } });
+    }
+
+    const docRecord = await db.visaDocuments.findById(req.params.id) || await db.visaDocuments.findOne({ documentId: req.params.id });
+    if (!docRecord) {
+      return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Document not found.' } });
+    }
+
+    if (docRecord.status === 'REPLACED') {
+      return res.status(400).json({ success: false, error: { code: 'DOCUMENT_ALREADY_REPLACED', message: 'This document has already been replaced and cannot be replaced again.' } });
+    }
+
+    const appRecord = await db.visaApplications.findById(docRecord.applicationId) || await db.visaApplications.findOne({ applicationNumber: docRecord.applicationId });
+    const isStaff = ['STAFF', 'ADMIN', 'SUPER_ADMIN'].includes(req.user.role);
+    const isOwner = docRecord.uploadedBy === req.user.id || (appRecord && appRecord.userId === req.user.id);
+
+    if (!isStaff && !isOwner) {
+      await logAudit(req, 'SUSPICIOUS_IDOR_DOCUMENT_REPLACE_ATTEMPT', 'VISA_DOCUMENT', req.params.id);
+      return res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Access denied: You do not own this document.' } });
+    }
+
+    const newDoc = await visaService.replaceDocument(
+      docRecord.id || docRecord.documentId,
+      req.file.buffer,
+      req.file.originalname,
+      req.file.mimetype,
+      req.user
+    );
+
+    await logAudit(req, `Replaced document: ${newDoc.documentType}`, 'VISA_DOCUMENT', newDoc.id);
+    res.json({ success: true, document: sanitizeDocument(newDoc), message: 'Document replaced successfully.' });
+  } catch (err) {
+    const status = err.statusCode || (err.code === 'CONCURRENT_REPLACEMENT' ? 409 : (err.code === 'NOT_FOUND' ? 404 : (err.code === 'FORBIDDEN' ? 403 : 400)));
+    res.status(status).json({ success: false, error: { code: err.code || 'REPLACE_ERROR', message: err.message } });
+  }
+});
+
+// DOCUMENT REVIEW (STAFF/ADMIN ONLY - Task #3 Section 18)
+app.post('/api/documents/:id/review', authenticate, authorize('STAFF', 'ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const { status, reviewNote } = req.body || {};
+    const updated = await visaService.reviewDocument(req.params.id, status, reviewNote, req.user);
+    await logAudit(req, `Reviewed document status to ${status}`, 'VISA_DOCUMENT', req.params.id);
+    res.json({ success: true, document: updated });
+  } catch (err) {
+    res.status(400).json({ success: false, error: { code: 'REVIEW_ERROR', message: err.message } });
+  }
+});
+
+// IDOR RESTRICTED PRIVATE DOCUMENT DOWNLOAD STREAMING (Task #3 Section 16)
+app.get('/api/documents/:id/download', authenticate, async (req, res) => {
+  try {
+    const docRecord = await db.visaDocuments.findById(req.params.id) || await db.visaDocuments.findOne({ documentId: req.params.id });
+    if (!docRecord) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Document record not found.' } });
+
+    const appRecord = await db.visaApplications.findById(docRecord.applicationId) || await db.visaApplications.findOne({ applicationNumber: docRecord.applicationId });
+
+    const isStaff = ['STAFF', 'ADMIN', 'SUPER_ADMIN'].includes(req.user.role);
+    const isOwner = docRecord.uploadedBy === req.user.id || (appRecord && appRecord.userId === req.user.id);
+
+    if (!isStaff && !isOwner) {
+      await logAudit(req, 'SUSPICIOUS_IDOR_DOCUMENT_ATTEMPT', 'VISA_DOCUMENT', req.params.id);
+      return res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Access denied: You do not own this document.' } });
+    }
+
+    if (!storageService.exists(docRecord.storageKey)) {
+      return res.status(404).json({ success: false, error: { code: 'FILE_MISSING', message: 'File missing from storage.' } });
+    }
+
+    await logAudit(req, 'DOCUMENT_ACCESSED', 'VISA_DOCUMENT', docRecord.id);
+
+    res.setHeader('Content-Type', docRecord.mimeType);
+    res.setHeader('Content-Disposition', `inline; filename="${docRecord.displayFilename || docRecord.originalFilename}"`);
+    
+    // Stream file contents via StorageService (Hides physical filesystem path)
+    const stream = storageService.downloadStream(docRecord.storageKey);
+    stream.pipe(res);
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// --- 5. TOURISM CATALOGUE & BOOKINGS ---
+// --- 5. TOURISM CATALOGUE & BOOKINGS (TASK #4 ENHANCED) ---
+
+// DESTINATIONS & CATEGORIES
+app.get('/api/tourism/destinations', async (req, res) => {
+  const cacheKey = `tourism:destinations:${req.locale}`;
+  const cached = cache.get(cacheKey);
+  if (cached) {
+    res.setHeader('Cache-Control', 'public, max-age=60');
+    return res.json(cached);
+  }
+  const destinations = await db.destinations.find({ active: true });
+  const response = { success: true, destinations };
+  cache.set(cacheKey, response, 60, ['destinations']);
+  res.setHeader('Cache-Control', 'public, max-age=60');
+  res.json(response);
+});
+
+app.get('/api/tourism/categories', async (req, res) => {
+  const cacheKey = `tourism:categories:${req.locale}`;
+  const cached = cache.get(cacheKey);
+  if (cached) {
+    res.setHeader('Cache-Control', 'public, max-age=60');
+    return res.json(cached);
+  }
+  const categories = await db.tourCategories.find({ active: true });
+  const response = { success: true, categories };
+  cache.set(cacheKey, response, 60, ['categories']);
+  res.setHeader('Cache-Control', 'public, max-age=60');
+  res.json(response);
+});
+
+// TOUR PACKAGES LISTING (FILTERING, SEARCH, WHITELISTED SORT, PAGINATION)
+app.get('/api/tourism/packages', optionalAuth, async (req, res) => {
+  try {
+    const userRole = req.user ? req.user.role : 'GUEST';
+    const cacheKey = `tourism:packages:${req.locale}:${req.currency}:${userRole}:${JSON.stringify(req.query)}`;
+    const cached = cache.get(cacheKey);
+    if (cached) {
+      res.setHeader('Cache-Control', 'public, max-age=60');
+      return res.json(cached);
+    }
+    const result = await tourismService.listPackages({ ...req.query, userRole });
+    const response = { success: true, ...result };
+    cache.set(cacheKey, response, 60, ['packages']);
+    res.setHeader('Cache-Control', 'public, max-age=60');
+    res.json(response);
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// LEGACY PACKAGES ENDPOINT (BACKWARD COMPATIBILITY)
+app.get('/api/packages', async (req, res) => {
+  const result = await tourismService.listPackages({ userRole: 'GUEST', limit: 50 });
+  const legacy = result.packages.map(p => ({ ...p, price: p.priceMinor ? p.priceMinor / 1000 : p.price || 189, rating: p.rating || 4.8 }));
+  res.json({ success: true, packages: legacy });
+});
+
+// TOUR PACKAGE DETAILS BY SLUG/ID
+app.get('/api/tourism/packages/:slug', optionalAuth, async (req, res) => {
+  try {
+    const userRole = req.user ? req.user.role : 'GUEST';
+    const pkg = await tourismService.getPackage(req.params.slug, userRole);
+    res.json({ success: true, package: pkg });
+  } catch (err) {
+    res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: err.message } });
+  }
+});
+
+// CREATE TOUR PACKAGE (STAFF/ADMIN ONLY)
+app.post('/api/tourism/packages', authenticate, authorize('STAFF', 'ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const pkg = await tourismService.createPackage(req.body, req.user);
+    cache.invalidateTags('packages', 'destinations', 'categories');
+    await logAudit(req, `Created tour package: ${pkg.title}`, 'TOUR_PACKAGE', pkg.id);
+    res.status(201).json({ success: true, package: pkg });
+  } catch (err) {
+    res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: err.message } });
+  }
+});
+
+// UPDATE TOUR PACKAGE (STAFF/ADMIN ONLY)
+app.patch('/api/tourism/packages/:id', authenticate, authorize('STAFF', 'ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const updated = await tourismService.updatePackage(req.params.id, req.body, req.user);
+    cache.invalidateTags('packages', 'destinations', 'categories');
+    await logAudit(req, `Updated tour package: ${updated.title}`, 'TOUR_PACKAGE', updated.id);
+    res.json({ success: true, package: updated });
+  } catch (err) {
+    res.status(400).json({ success: false, error: { code: 'UPDATE_ERROR', message: err.message } });
+  }
+});
+
+// CREATE TOUR BOOKING (SERVER PRICING, CAPACITY CHECK, CONCURRENCY & IDEMPOTENCY)
+app.post('/api/tourism/bookings', optionalAuth, submissionLimiter, async (req, res) => {
+  try {
+    const { website } = req.body || {};
+    if (website) return res.json({ success: true, reference: 'JMT-B-SPAM' });
+
+    const result = await tourismService.createBooking(req.body, req.user);
+    const booking = result.booking;
+
+    if (result.isDuplicate) {
+      return res.status(200).json({
+        success: true,
+        reference: booking.bookingNumber,
+        status: booking.status,
+        amount: booking.amount,
+        currency: booking.currency,
+        message: 'Duplicate request detected. Returned existing booking.',
+        isDuplicate: true,
+        booking
+      });
+    }
+
+    await logAudit(req, `Created tour booking ${booking.bookingNumber}`, 'TOUR_BOOKING', booking.id || booking.bookingNumber);
+
+    res.status(201).json({
+      success: true,
+      reference: booking.bookingNumber,
+      status: booking.status,
+      amount: booking.amount,
+      currency: booking.currency,
+      message: 'Booking request created successfully.',
+      booking
+    });
+  } catch (err) {
+    const status = err.message.includes('Insufficient Capacity') || err.message.includes('Validation Error') || err.message.includes('Booking Denied') ? 400 : 500;
+    res.status(status).json({ success: false, error: { code: status === 400 ? 'VALIDATION_ERROR' : 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// LEGACY BOOKINGS ENDPOINT (BACKWARD COMPATIBILITY)
+app.post('/api/bookings', submissionLimiter, async (req, res) => {
+  try {
+    const result = await tourismService.createBooking(req.body, req.user);
+    const booking = result.booking;
+    res.status(201).json({
+      success: true,
+      reference: booking.bookingNumber,
+      status: booking.status,
+      amount: booking.amount,
+      currency: booking.currency,
+      message: 'Reservation requested.'
+    });
+  } catch (err) {
+    res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: err.message } });
+  }
+});
+
+// LIST TOUR BOOKINGS (IDOR ISOLATED)
+app.get('/api/tourism/bookings', authenticate, async (req, res) => {
+  const isStaff = ['STAFF', 'ADMIN', 'SUPER_ADMIN'].includes(req.user.role);
+  const filter = isStaff ? {} : { userId: req.user.id };
+  const rawBookings = await db.tourBookings.find(filter);
+  const bookings = rawBookings.map(b => tourismService.sanitizeBooking(b, req.user.role));
+  res.json({ success: true, bookings });
+});
+
+// IDOR RESTRICTED TOUR BOOKING DETAIL VIEW
+app.get('/api/tourism/bookings/:id', authenticate, async (req, res) => {
+  const booking = await db.tourBookings.findById(req.params.id) || await db.tourBookings.findOne({ bookingNumber: req.params.id });
+  if (!booking) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Booking not found.' } });
+
+  const isStaff = ['STAFF', 'ADMIN', 'SUPER_ADMIN'].includes(req.user.role);
+  if (!isStaff && booking.userId !== req.user.id) {
+    await logAudit(req, 'SUSPICIOUS_IDOR_BOOKING_ATTEMPT', 'TOUR_BOOKING', req.params.id);
+    return res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Access denied: You do not own this booking.' } });
+  }
+
+  const travellers = await db.bookingTravellers.find({ bookingId: booking.id });
+  const sanitized = tourismService.sanitizeBooking(booking, req.user.role);
+
+  res.json({ success: true, booking: sanitized, travellers });
+});
+
+// SERVER-CONTROLLED BOOKING STATE TRANSITION
+app.patch('/api/tourism/bookings/:id/status', authenticate, async (req, res) => {
+  try {
+    const { status, note } = req.body || {};
+    const updated = await tourismService.transitionBookingStatus(req.params.id, status, req.user, note);
+    await logAudit(req, `Changed booking status to ${status}`, 'TOUR_BOOKING', req.params.id);
+    res.json({ success: true, booking: tourismService.sanitizeBooking(updated, req.user.role) });
+  } catch (err) {
+    res.status(400).json({ success: false, error: { code: 'TRANSITION_ERROR', message: err.message } });
+  }
+});
+
+// BOOKING CANCELLATION & CAPACITY RELEASE
+app.post('/api/tourism/bookings/:id/cancel', authenticate, async (req, res) => {
+  try {
+    const { reason } = req.body || {};
+    const updated = await tourismService.cancelBooking(req.params.id, req.user, reason);
+    await logAudit(req, 'Cancelled tour booking', 'TOUR_BOOKING', req.params.id);
+    res.json({ success: true, booking: tourismService.sanitizeBooking(updated, req.user.role) });
+  } catch (err) {
+    res.status(400).json({ success: false, error: { code: 'CANCELLATION_ERROR', message: err.message } });
+  }
+});
+
+// REFUND REQUEST WORKFLOW (STAFF/ADMIN ONLY)
+app.post('/api/tourism/bookings/:id/refund', authenticate, authorize('STAFF', 'ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const { reason, amount } = req.body || {};
+    const refundRecord = await tourismService.requestRefund(req.params.id, req.user, reason, amount);
+    await logAudit(req, `Requested refund of ${refundRecord.amount} OMR`, 'REFUND', refundRecord.id);
+    res.status(201).json({ success: true, refund: refundRecord });
+  } catch (err) {
+    res.status(400).json({ success: false, error: { code: 'REFUND_ERROR', message: err.message } });
+  }
+});
+
+// --- 6. PAYMENTS & WEBHOOKS (TASK #5 ENHANCED) ---
+
+// CREATE PAYMENT ORDER (AUTHORITATIVE AMOUNT, IDOR PROTECTION, IDEMPOTENCY)
+app.post('/api/payments/create-order', authenticate, submissionLimiter, async (req, res) => {
+  try {
+    const { bookingId, visaApplicationId, idempotencyKey } = req.body || {};
+    const result = await paymentService.createPaymentOrder({
+      userId: req.user.id,
+      bookingId,
+      visaApplicationId,
+      idempotencyKey,
+      actorUser: req.user
+    });
+
+    await logAudit(req, `Created payment order ${result.paymentNumber}`, 'PAYMENT', result.payment ? result.payment.id : result.paymentNumber);
+
+    res.status(result.isDuplicate ? 200 : 201).json(result);
+  } catch (err) {
+    const isForbidden = err.message.includes('Permission Denied');
+    const isValidation = err.message.includes('Payment Error') || err.message.includes('Validation Error');
+    const status = isForbidden ? 403 : (isValidation ? 400 : 500);
+    res.status(status).json({ success: false, error: { code: isForbidden ? 'FORBIDDEN' : (isValidation ? 'VALIDATION_ERROR' : 'SERVER_ERROR'), message: err.message } });
+  }
+});
+
+// GET PAYMENT DETAIL (IDOR RESTRICTED)
+app.get('/api/payments/:id', authenticate, async (req, res) => {
+  try {
+    const payment = await db.payments.findById(req.params.id) || await db.payments.findOne({ paymentNumber: req.params.id });
+    if (!payment) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Payment record not found.' } });
+
+    const isStaff = ['STAFF', 'ADMIN', 'SUPER_ADMIN'].includes(req.user.role);
+    if (!isStaff && payment.userId !== req.user.id) {
+      await logAudit(req, 'SUSPICIOUS_IDOR_PAYMENT_ATTEMPT', 'PAYMENT', req.params.id);
+      return res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Access denied: You do not own this payment record.' } });
+    }
+
+    res.json({ success: true, payment: paymentService.sanitizePayment(payment, req.user.role) });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// SECURE PROVIDER WEBHOOK LISTENER (SIGNATURE VERIFICATION, REPLAY PROTECTION, AMOUNT RECONCILIATION)
+app.post('/api/payments/webhook', async (req, res) => {
+  try {
+    const signature = req.get('x-signature') || req.get('x-paytabs-signature') || req.get('x-thawani-signature') || req.get('x-razorpay-signature') || 'sandbox';
+    const rawBody = JSON.stringify(req.body);
+    const result = await paymentService.handleWebhook(rawBody, signature, req.body);
+    res.json(result);
+  } catch (err) {
+    const isSecurity = err.message.includes('Security Violation') || err.message.includes('signature');
+    const isMismatch = err.message.includes('mismatch');
+    const status = isSecurity ? 401 : (isMismatch ? 400 : 400);
+    res.status(status).json({ success: false, error: { code: isSecurity ? 'UNAUTHORIZED_SIGNATURE' : 'WEBHOOK_FAILED', message: err.message } });
+  }
+});
+
+// PROCESS REFUND WORKFLOW (STAFF/ADMIN ONLY)
+app.post('/api/payments/:id/refund', authenticate, authorize('STAFF', 'ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const { amount, reason, idempotencyKey } = req.body || {};
+    const result = await paymentService.processRefund({
+      paymentId: req.params.id,
+      amount,
+      reason,
+      idempotencyKey,
+      actorUser: req.user
+    });
+
+    await logAudit(req, `Processed refund for payment ${req.params.id}`, 'REFUND', result.refund ? result.refund.id : req.params.id);
+    res.status(result.isDuplicate ? 200 : 201).json(result);
+  } catch (err) {
+    res.status(400).json({ success: false, error: { code: 'REFUND_ERROR', message: err.message } });
+  }
+});
+
+// --- 6.5 CUSTOMER NOTIFICATIONS & COMMUNICATION CENTER (V5.6) ---
+
+// 1. LIST IN-APP NOTIFICATIONS (IDOR ISOLATED, PAGINATED, CATEGORY & UNREAD FILTERED)
+app.get(['/api/account/notifications', '/api/notifications'], authenticate, async (req, res) => {
+  try {
+    const unread = req.query.unread !== undefined ? req.query.unread : req.query.unreadOnly;
+    const result = await notificationService.listInAppNotifications({
+      userId: req.user.id,
+      page: req.query.page,
+      limit: req.query.limit,
+      unreadOnly: unread,
+      category: req.query.category
+    });
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// 2. GET SINGLE IN-APP NOTIFICATION BY ID (IDOR ISOLATED)
+app.get(['/api/account/notifications/:id', '/api/notifications/:id'], authenticate, async (req, res) => {
+  try {
+    const notifId = String(req.params.id || '').trim();
+    if (!notifId) {
+      return res.status(400).json({ success: false, error: { code: 'INVALID_ID', message: 'Notification ID is required.' } });
+    }
+
+    const notif = await db.notifications.findById(notifId) || await db.notifications.findOne({ id: notifId });
+    if (!notif) {
+      return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Notification not found.' } });
+    }
+
+    if (notif.userId !== req.user.id) {
+      await logAudit(req, 'SUSPICIOUS_IDOR_NOTIFICATION_ACCESS_ATTEMPT', 'NOTIFICATION', notifId);
+      return res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Access denied: You do not own this notification.' } });
+    }
+
+    res.json({
+      success: true,
+      notification: notificationService.formatCustomerNotificationDTO(notif)
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// 3. MARK INDIVIDUAL NOTIFICATION AS READ (IDOR ISOLATED)
+app.patch(['/api/account/notifications/:id/read', '/api/notifications/:id/read'], authenticate, async (req, res) => {
+  try {
+    const updated = await notificationService.markAsRead(req.params.id, req.user.id);
+    const unreadCount = await db.notifications.count({ userId: req.user.id, read: false });
+    res.json({ success: true, notification: updated, unreadCount });
+  } catch (err) {
+    const isForbidden = err.message.includes('Permission Denied');
+    const isNotFound = err.message.includes('not found');
+    const statusCode = isForbidden ? 403 : (isNotFound ? 404 : 400);
+    const errorCode = isForbidden ? 'FORBIDDEN' : (isNotFound ? 'NOT_FOUND' : 'VALIDATION_ERROR');
+    res.status(statusCode).json({ success: false, error: { code: errorCode, message: err.message } });
+  }
+});
+
+// 4. MARK ALL NOTIFICATIONS AS READ (TENANT ISOLATED)
+app.patch(['/api/account/notifications/read-all', '/api/notifications/read-all'], authenticate, async (req, res) => {
+  try {
+    const result = await notificationService.markAllAsRead(req.user.id);
+    res.json({ success: true, message: 'All in-app notifications marked as read.', count: result.count, updatedCount: result.count, unreadCount: 0 });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// --- 7. CHATBOT & SUPPORT TICKETS ---
+app.post('/api/chat', async (req, res) => {
+  try {
+    const { message, conversationId } = req.body || {};
+    const response = await chatbotService.processMessage({ message, conversationId, user: req.user });
+    res.json({ success: true, ...response });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'CHAT_ERROR', message: err.message } });
+  }
+});
+
+app.post('/api/support/tickets', submissionLimiter, async (req, res) => {
+  try {
+    const { subject, message, category } = req.body || {};
+    if (!subject || !message) {
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Subject and message are required.' } });
+    }
+
+    const ticketId = `TCK-${Date.now().toString().slice(-6)}-${Math.floor(100 + Math.random() * 900)}`;
+    const ticketNumber = `JMT-T-${Math.floor(100000 + Math.random() * 900000)}`;
+    const ticketMessage = String(message).trim();
+    const ticket = await db.supportTickets.create({
+      ticketId,
+      ticketNumber,
+      userId: req.user ? req.user.id : null,
+      userName: req.user ? req.user.name : 'Guest',
+      userEmail: req.user ? req.user.email : null,
+      subject: String(subject).trim(),
+      category: category || 'General',
+      priority: 'MEDIUM',
+      status: 'OPEN',
+      messages: [{
+        sender: req.user ? 'CUSTOMER' : 'GUEST',
+        senderId: req.user ? req.user.id : null,
+        senderName: req.user ? req.user.name : 'Guest',
+        message: ticketMessage,
+        text: ticketMessage,
+        timestamp: new Date().toISOString()
+      }]
+    });
+
+    if (req.user) {
+      notificationService.dispatchEvent('SUPPORT_TICKET_CREATED', {
+        user: req.user,
+        reference: ticket.ticketNumber || ticket.ticketId,
+        title: `Support Ticket Received: ${ticket.subject}`,
+        message: `Your support ticket (${ticket.ticketNumber || ticket.ticketId}) has been submitted to JMT help desk.`
+      }).catch(() => {});
+    }
+
+    res.status(201).json({ success: true, ticket });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+app.get('/api/support/tickets', authenticate, async (req, res) => {
+  const isStaff = ['STAFF', 'ADMIN', 'SUPER_ADMIN'].includes(req.user.role);
+  const filter = isStaff ? {} : { userId: req.user.id };
+  const tickets = await db.supportTickets.find(filter);
+  res.json({ success: true, tickets });
+});
+
+// GET INDIVIDUAL SUPPORT TICKET (IDOR RESTRICTED)
+app.get('/api/support/tickets/:id', authenticate, async (req, res) => {
+  try {
+    const ticket = await db.supportTickets.findById(req.params.id) ||
+      await db.supportTickets.findOne({ ticketId: req.params.id }) ||
+      await db.supportTickets.findOne({ ticketNumber: req.params.id });
+    if (!ticket) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Support ticket not found.' } });
+
+    const isStaff = ['STAFF', 'ADMIN', 'SUPER_ADMIN'].includes(req.user.role);
+    if (!isStaff && ticket.userId !== req.user.id) {
+      await logAudit(req, 'SUSPICIOUS_IDOR_SUPPORT_ATTEMPT', 'SUPPORT_TICKET', req.params.id);
+      return res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Access denied: You do not own this support ticket.' } });
+    }
+
+    const messages = await db.chatMessages.find({ conversationId: ticket.conversationId || ticket.id });
+    res.json({ success: true, ticket, messages });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// --- 8. REVIEWS & FEEDBACK ---
+app.get('/api/reviews', async (req, res) => {
+  const reviews = await db.reviews.find({}, null, { sort: { createdAt: -1 }, limit: 50 });
+  const count = reviews.length;
+  const totalScore = reviews.reduce((sum, r) => sum + (Number(r.rating) || 0), 0);
+  const average = count > 0 ? parseFloat((totalScore / count).toFixed(1)) : 5.0;
+  res.json({ success: true, reviews, count, average });
+});
+
+app.post('/api/reviews', submissionLimiter, async (req, res) => {
+  const { name, rating, message, website } = req.body || {};
+  if (website) return res.json({ success: true, message: 'Review published.' });
+  const review = await db.reviews.create({ name, rating: parseInt(rating, 10) || 5, message });
+  res.status(201).json({ success: true, review });
+});
+
+app.post('/api/feedback', submissionLimiter, async (req, res) => {
+  try {
+    const { name, contact, type, message, website } = req.body || {};
+    if (website) return res.json({ success: true, message: 'Feedback received.' });
+
+    await db.contactInquiries.create({ name, contact, type, message, status: 'OPEN' });
+
+    // Email delivery is a secondary notification. Do not fail the customer's
+    // inquiry submission when the mail provider is unavailable/misconfigured.
+    try {
+      await notificationService.sendEmail({
+        to: process.env.FEEDBACK_EMAIL || 'info@jmttravels.com',
+        subject: `[JMT Contact] ${type}: ${name}`,
+        text: message
+      });
+    } catch (emailErr) {
+      console.error('[FEEDBACK EMAIL ERROR]', emailErr.message);
+    }
+
+    return res.json({ success: true, message: 'Thank you for your feedback.' });
+  } catch (err) {
+    console.error('[FEEDBACK API ERROR]', err.message);
+    return res.status(500).json({
+      success: false,
+      error: { code: 'FEEDBACK_ERROR', message: 'Unable to submit your enquiry right now. Please try again.' }
+    });
+  }
+});
+
+// --- 9. PUBLIC TRACKING ---
+app.get('/api/track/:reference', async (req, res) => {
+  const ref = String(req.params.reference || '').trim().toUpperCase();
+  const visaApp = await db.visaApplications.findOne({ applicationNumber: ref }) || await db.visaApplications.findById(ref);
+  const booking = await db.tourBookings.findOne({ bookingNumber: ref }) || await db.tourBookings.findById(ref);
+  const record = visaApp || booking;
+
+  if (!record) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Invalid JMT reference number.' } });
+
+  res.json({
+    success: true,
+    type: visaApp ? 'visa' : 'booking',
+    reference: record.applicationNumber || record.bookingNumber || record.id,
+    status: record.status,
+    title: visaApp ? `${record.destination} Visa` : record.packageTitle,
+    createdAt: record.createdAt
+  });
+});
+
+// --- 10. TASK #8 — ADMIN & OPERATIONS SYSTEM ---
+
+// Helper: Sanitize search regex terms to prevent Regex / Injection vulnerabilities
+function escapeRegex(text) {
+  if (!text || typeof text !== 'string') return '';
+  return text.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&');
+}
+
+// 10.1 OPERATIONAL DASHBOARD / OVERVIEW METRICS API
+app.get(['/api/admin/dashboard', '/api/admin/overview'], authenticate, authorize('STAFF', 'ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const [users, visas, packages, destinations, categories, bookings, payments, refunds, tickets, inquiries, notifications] = await Promise.all([
+      db.users.find({}, { projection: { status: 1 }, lean: true }),
+      db.visaApplications.find({}, { projection: { status: 1 }, lean: true }),
+      db.tourPackages.find({}, { projection: { published: 1, active: 1 }, lean: true }),
+      db.destinations.find({}, { projection: { id: 1 }, lean: true }),
+      db.tourCategories.find({}, { projection: { id: 1 }, lean: true }),
+      db.tourBookings.find({}, { projection: { status: 1 }, lean: true }),
+      db.payments.find({}, { projection: { status: 1 }, lean: true }),
+      db.refunds.find({}, { projection: { status: 1 }, lean: true }),
+      db.supportTickets.find({}, { projection: { status: 1 }, lean: true }),
+      db.contactInquiries.find({}, { projection: { id: 1 }, lean: true }),
+      db.notifications.find({}, { projection: { read: 1 }, lean: true })
+    ]);
+
+    const metrics = {
+      customers: {
+        total: users.length,
+        active: users.filter(u => u.status === 'ACTIVE').length,
+        unverified: users.filter(u => u.status === 'UNVERIFIED').length,
+        suspended: users.filter(u => u.status === 'SUSPENDED').length,
+        disabled: users.filter(u => u.status === 'DISABLED').length
+      },
+      visa: {
+        total: visas.length,
+        draft: visas.filter(v => v.status === 'DRAFT').length,
+        submitted: visas.filter(v => v.status === 'SUBMITTED').length,
+        underReview: visas.filter(v => ['DOCUMENT_REVIEW', 'UNDER_REVIEW'].includes(v.status)).length,
+        additionalDocsRequired: visas.filter(v => v.status === 'ADDITIONAL_DOCUMENTS_REQUIRED').length,
+        processing: visas.filter(v => v.status === 'PROCESSING').length,
+        approved: visas.filter(v => v.status === 'APPROVED').length,
+        rejected: visas.filter(v => v.status === 'REJECTED').length,
+        cancelled: visas.filter(v => v.status === 'CANCELLED').length
+      },
+      tourism: {
+        totalPackages: packages.length,
+        publishedPackages: packages.filter(p => p.published).length,
+        activePackages: packages.filter(p => p.active !== false).length,
+        destinations: destinations.length,
+        categories: categories.length
+      },
+      bookings: {
+        total: bookings.length,
+        pending: bookings.filter(b => b.status === 'PENDING_PAYMENT').length,
+        confirmed: bookings.filter(b => b.status === 'CONFIRMED').length,
+        cancelled: bookings.filter(b => b.status === 'CANCELLED').length,
+        completed: bookings.filter(b => b.status === 'COMPLETED').length
+      },
+      payments: {
+        total: payments.length,
+        initiated: payments.filter(p => p.status === 'INITIATED').length,
+        pending: payments.filter(p => p.status === 'PENDING').length,
+        paid: payments.filter(p => p.status === 'PAID').length,
+        failed: payments.filter(p => p.status === 'FAILED').length,
+        refunded: payments.filter(p => p.status === 'REFUNDED').length,
+        partiallyRefunded: payments.filter(p => p.status === 'PARTIALLY_REFUNDED').length
+      },
+      refunds: {
+        total: refunds.length,
+        completed: refunds.filter(r => r.status === 'COMPLETED').length
+      },
+      support: {
+        total: tickets.length,
+        open: tickets.filter(t => t.status === 'OPEN').length,
+        pending: tickets.filter(t => t.status === 'IN_PROGRESS').length,
+        recentlyUpdated: tickets.slice(-5)
+      },
+      contact: {
+        total: inquiries.length,
+        unresolved: inquiries.filter(c => !c.resolved).length
+      },
+      notifications: {
+        total: notifications.length,
+        failed: notifications.filter(n => n.status === 'FAILED').length,
+        pending: notifications.filter(n => n.status === 'PENDING').length
+      }
+    };
+
+    res.json({
+      success: true,
+      metrics,
+      recentBookings: bookings.slice(-5).reverse(),
+      recentVisas: visas.slice(-5).reverse()
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// 10.2 USER & CUSTOMER MANAGEMENT API
+app.get('/api/admin/users', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+    const role = req.query.role;
+    const status = req.query.status;
+    const search = (req.query.search || '').trim();
+
+    const filter = {};
+    if (role && ['CUSTOMER', 'STAFF', 'ADMIN', 'SUPER_ADMIN'].includes(role)) {
+      filter.role = role;
+    }
+    if (status && ['ACTIVE', 'UNVERIFIED', 'SUSPENDED', 'DISABLED'].includes(status)) {
+      filter.status = status;
+    }
+    if (search) {
+      const rx = new RegExp(escapeRegex(search), 'i');
+      filter.$or = [{ name: rx }, { email: rx }, { phone: rx }];
+    }
+
+    const { data: usersData, total, totalPages } = await db.users.findPaginated(filter, null, { page, limit, sort: { createdAt: -1 } });
+    const paginatedUsers = usersData.map(u => sanitizeUser(u));
+
+    res.json({
+      success: true,
+      users: paginatedUsers,
+      pagination: { total, page, limit, totalPages }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+app.get('/api/admin/users/:id', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const user = await db.users.findById(req.params.id);
+    if (!user) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'User not found.' } });
+
+    const profile = await db.customerProfiles.findOne({ userId: user.id });
+    const visas = await db.visaApplications.find({ userId: user.id });
+    const bookings = await db.tourBookings.find({ userId: user.id });
+    const payments = await db.payments.find({ userId: user.id });
+
+    res.json({
+      success: true,
+      user: sanitizeUser(user),
+      profile: profile || null,
+      activitySummary: {
+        visaCount: visas.length,
+        bookingCount: bookings.length,
+        paymentCount: payments.length
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+app.patch('/api/admin/users/:id/status', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const { status, reason } = req.body || {};
+    const validStatuses = ['ACTIVE', 'SUSPENDED', 'DISABLED'];
+    if (!status || !validStatuses.includes(status)) {
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Valid status (ACTIVE, SUSPENDED, DISABLED) is required.' } });
+    }
+
+    const user = await db.users.findById(req.params.id);
+    if (!user) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'User not found.' } });
+
+    // Protect SUPER_ADMIN accounts from non-SUPER_ADMIN modifications
+    if (user.role === 'SUPER_ADMIN' && req.user.role !== 'SUPER_ADMIN') {
+      return res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Only SUPER_ADMIN can modify a SUPER_ADMIN account.' } });
+    }
+
+    const updates = { status };
+    if (status === 'SUSPENDED' || status === 'DISABLED') {
+      updates.tokenInvalidatedBefore = new Date(); // Revoke active sessions immediately
+    }
+
+    const updatedUser = await db.users.update(user.id, updates);
+    await logAudit(req, `USER_STATUS_CHANGE_${status}`, 'USER', user.id, { reason });
+
+    res.json({
+      success: true,
+      user: sanitizeUser(updatedUser),
+      message: `User status changed to ${status}.`
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// 10.3 VISA OPERATIONS API (STAFF/ADMIN/SUPER_ADMIN)
+app.get('/api/admin/visa-applications', authenticate, authorize('STAFF', 'ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+    const status = req.query.status;
+    const visaServiceId = req.query.visaServiceId;
+    const search = (req.query.search || '').trim();
+
+    const filter = {};
+    if (status) filter.status = status;
+    if (visaServiceId) filter.visaServiceId = visaServiceId;
+    if (search) {
+      const rx = new RegExp(escapeRegex(search), 'i');
+      filter.$or = [{ applicationNumber: rx }, { fullName: rx }, { email: rx }];
+    }
+
+    const { data: appsData, total, totalPages } = await db.visaApplications.findPaginated(filter, null, { page, limit, sort: { createdAt: -1 } });
+    const paginatedApps = appsData.map(a => visaService.sanitizeApplication(a, req.user.role));
+
+    res.json({
+      success: true,
+      applications: paginatedApps,
+      pagination: { total, page, limit, totalPages }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+app.post('/api/admin/visa-applications/:id/notes', authenticate, authorize('STAFF', 'ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const { note } = req.body || {};
+    if (!note || !note.trim()) {
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Note text is required.' } });
+    }
+
+    const appRecord = await db.visaApplications.findById(req.params.id) || await db.visaApplications.findOne({ applicationNumber: req.params.id });
+    if (!appRecord) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Application not found.' } });
+
+    const internalNotes = appRecord.internalNotes || [];
+    internalNotes.push({
+      authorId: req.user.id,
+      authorName: req.user.name,
+      authorRole: req.user.role,
+      note: note.trim(),
+      timestamp: new Date().toISOString()
+    });
+
+    const updated = await db.visaApplications.update(appRecord.id, { internalNotes });
+    await logAudit(req, 'ADD_VISA_INTERNAL_NOTE', 'VISA_APPLICATION', appRecord.id);
+
+    res.json({ success: true, internalNotes: updated.internalNotes });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// 10.4 DOCUMENT OPERATIONS API
+app.get('/api/admin/documents', authenticate, authorize('STAFF', 'ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+    const status = req.query.status;
+
+    let docs = await db.visaDocuments.find();
+    if (status) docs = docs.filter(d => d.status === status);
+
+    const total = docs.length;
+    const totalPages = Math.ceil(total / limit) || 1;
+    const startIndex = (page - 1) * limit;
+    const paginatedDocs = docs.slice(startIndex, startIndex + limit).map(d => ({
+      id: d.id,
+      documentId: d.documentId,
+      applicationId: d.applicationId,
+      documentType: d.documentType,
+      originalName: d.originalName,
+      mimeType: d.mimeType,
+      fileSize: d.fileSize,
+      status: d.status,
+      uploadedAt: d.createdAt || d.uploadedAt
+    }));
+
+    res.json({
+      success: true,
+      documents: paginatedDocs,
+      pagination: { total, page, limit, totalPages }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// 10.5 TOURISM & TOUR PACKAGE MANAGEMENT API (ADMIN/SUPER_ADMIN WRITE)
+app.get('/api/admin/tour-packages', authenticate, authorize('STAFF', 'ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const packages = await db.tourPackages.find();
+    res.json({ success: true, packages });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+app.post('/api/admin/tour-packages', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const created = await tourismService.createPackage(req.body, req.user);
+    await logAudit(req, 'CREATE_TOUR_PACKAGE', 'TOUR_PACKAGE', created.id);
+    res.status(201).json({ success: true, package: created });
+  } catch (err) {
+    res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: err.message } });
+  }
+});
+
+app.patch('/api/admin/tour-packages/:id', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const updated = await tourismService.updatePackage(req.params.id, req.body, req.user);
+    await logAudit(req, 'UPDATE_TOUR_PACKAGE', 'TOUR_PACKAGE', updated.id);
+    res.json({ success: true, package: updated });
+  } catch (err) {
+    res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: err.message } });
+  }
+});
+
+app.post('/api/admin/destinations', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const { name, country, description, featured } = req.body || {};
+    if (!name || !country) {
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Destination name and country are required.' } });
+    }
+
+    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+    const dest = await db.destinations.create({
+      slug,
+      name: name.trim(),
+      country: country.trim(),
+      description: description || '',
+      featured: Boolean(featured),
+      published: true
+    });
+
+    await logAudit(req, 'CREATE_DESTINATION', 'DESTINATION', dest.id);
+    res.status(201).json({ success: true, destination: dest });
+  } catch (err) {
+    res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: err.message } });
+  }
+});
+
+app.post('/api/admin/categories', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const { name, description } = req.body || {};
+    if (!name) {
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Category name is required.' } });
+    }
+
+    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+    const cat = await db.tourCategories.create({
+      slug,
+      name: name.trim(),
+      description: description || '',
+      active: true
+    });
+
+    await logAudit(req, 'CREATE_TOUR_CATEGORY', 'TOUR_CATEGORY', cat.id);
+    res.status(201).json({ success: true, category: cat });
+  } catch (err) {
+    res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: err.message } });
+  }
+});
+
+// 10.6 BOOKING OPERATIONS API
+app.get('/api/admin/bookings', authenticate, authorize('STAFF', 'ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+    const status = req.query.status;
+    const search = (req.query.search || '').trim();
+
+    const filter = {};
+    if (status) filter.status = status;
+    if (search) {
+      const rx = new RegExp(escapeRegex(search), 'i');
+      filter.$or = [{ bookingNumber: rx }, { travellerName: rx }, { email: rx }, { packageTitle: rx }];
+    }
+
+    const { data: paginatedBookings, total, totalPages } = await db.tourBookings.findPaginated(filter, null, { page, limit, sort: { createdAt: -1 } });
+
+    res.json({
+      success: true,
+      bookings: paginatedBookings,
+      pagination: { total, page, limit, totalPages }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+app.get('/api/admin/bookings/:id', authenticate, authorize('STAFF', 'ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const booking = await db.tourBookings.findById(req.params.id) || await db.tourBookings.findOne({ bookingNumber: req.params.id });
+    if (!booking) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Booking record not found.' } });
+
+    const travellers = await db.bookingTravellers.find({ bookingId: booking.id });
+    const payments = await db.payments.find({ bookingId: booking.id });
+
+    res.json({
+      success: true,
+      booking,
+      travellers,
+      payments
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+app.patch('/api/admin/bookings/:id/status', authenticate, authorize('STAFF', 'ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const { status } = req.body || {};
+    const updated = await tourismService.transitionBookingStatus(req.params.id, status, req.user);
+    await logAudit(req, `CHANGED_BOOKING_STATUS_${status}`, 'TOUR_BOOKING', req.params.id);
+    res.json({ success: true, booking: updated });
+  } catch (err) {
+    res.status(400).json({ success: false, error: { code: 'TRANSITION_ERROR', message: err.message } });
+  }
+});
+
+// 10.7 PAYMENT & REFUND OPERATIONS API
+app.get('/api/admin/payments', authenticate, authorize('STAFF', 'ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+    const status = req.query.status;
+    const provider = req.query.provider;
+    const currency = req.query.currency;
+    const search = (req.query.search || '').trim();
+
+    const filter = {};
+    if (status) filter.status = status;
+    if (provider) filter.provider = provider;
+    if (currency) filter.currency = currency;
+    if (search) {
+      const rx = new RegExp(escapeRegex(search), 'i');
+      filter.$or = [{ paymentNumber: rx }, { providerOrderId: rx }, { userId: rx }];
+    }
+
+    const { data: pymtsData, total, totalPages } = await db.payments.findPaginated(filter, null, { page, limit, sort: { createdAt: -1 } });
+    const paginatedPayments = pymtsData.map(p => paymentService.sanitizePayment(p, req.user.role));
+
+    res.json({
+      success: true,
+      payments: paginatedPayments,
+      pagination: { total, page, limit, totalPages }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+app.get('/api/admin/refunds', authenticate, authorize('STAFF', 'ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+
+    const { data: paginatedRefunds, total, totalPages } = await db.refunds.findPaginated({}, null, { page, limit, sort: { createdAt: -1 } });
+
+    res.json({
+      success: true,
+      refunds: paginatedRefunds,
+      pagination: { total, page, limit, totalPages }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// CUSTOMER SUPPORT TICKET REPLY (STRICT OWNERSHIP)
+app.post('/api/support/tickets/:id/reply', authenticate, submissionLimiter, async (req, res) => {
+  try {
+    const message = String(req.body?.message || '').trim();
+    if (!message) {
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Reply message is required.' } });
+    }
+
+    const ticket = await db.supportTickets.findById(req.params.id) ||
+      await db.supportTickets.findOne({ ticketId: req.params.id }) ||
+      await db.supportTickets.findOne({ ticketNumber: req.params.id });
+
+    if (!ticket) {
+      return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Support ticket not found.' } });
+    }
+
+    const isStaff = ['STAFF', 'ADMIN', 'SUPER_ADMIN'].includes(req.user.role);
+    if (!isStaff && ticket.userId !== req.user.id) {
+      await logAudit(req, 'SUSPICIOUS_IDOR_SUPPORT_REPLY_ATTEMPT', 'SUPPORT_TICKET', req.params.id);
+      return res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Access denied: You do not own this support ticket.' } });
+    }
+
+    const reply = {
+      sender: isStaff ? 'STAFF' : 'CUSTOMER',
+      senderId: req.user.id,
+      senderName: req.user.name,
+      message,
+      text: message,
+      timestamp: new Date().toISOString()
+    };
+
+    const messages = Array.isArray(ticket.messages) ? [...ticket.messages, reply] : [reply];
+    const updatedTicket = await db.supportTickets.update(ticket.id, {
+      messages,
+      status: isStaff ? 'IN_PROGRESS' : 'OPEN'
+    });
+
+    if (!isStaff && ticket.userId) {
+      await logAudit(req, 'CUSTOMER_SUPPORT_REPLY', 'SUPPORT_TICKET', ticket.id);
+    }
+
+    res.json({ success: true, ticket: updatedTicket, reply });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// 10.8 SUPPORT TICKETS & CONTACT INQUIRIES OPERATIONS API
+app.get('/api/admin/support/tickets', authenticate, authorize('STAFF', 'ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+    const status = req.query.status;
+    const search = (req.query.search || '').trim();
+
+    const filter = {};
+    if (status) filter.status = status;
+    if (search) {
+      const rx = new RegExp(escapeRegex(search), 'i');
+      filter.$or = [{ ticketNumber: rx }, { subject: rx }, { userEmail: rx }];
+    }
+
+    const { data: paginatedTickets, total, totalPages } = await db.supportTickets.findPaginated(filter, null, { page, limit, sort: { createdAt: -1 } });
+
+    res.json({
+      success: true,
+      tickets: paginatedTickets,
+      pagination: { total, page, limit, totalPages }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+app.get('/api/admin/support/tickets/:id', authenticate, authorize('STAFF', 'ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const ticket = await db.supportTickets.findById(req.params.id) || await db.supportTickets.findOne({ ticketNumber: req.params.id });
+    if (!ticket) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Support ticket not found.' } });
+
+    const messages = await db.chatMessages.find({ conversationId: ticket.conversationId || ticket.id });
+
+    res.json({
+      success: true,
+      ticket,
+      messages
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+app.post('/api/admin/support/tickets/:id/reply', authenticate, authorize('STAFF', 'ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const { message, status } = req.body || {};
+    if (!message || !message.trim()) {
+      return res.status(400).json({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Reply message is required.' } });
+    }
+
+    const ticket = await db.supportTickets.findById(req.params.id) || await db.supportTickets.findOne({ ticketNumber: req.params.id });
+    if (!ticket) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Support ticket not found.' } });
+
+    const replyMsg = await db.chatMessages.create({
+      conversationId: ticket.conversationId || ticket.id,
+      sender: 'STAFF',
+      senderId: req.user.id,
+      senderName: req.user.name,
+      text: message.trim(),
+      timestamp: new Date().toISOString()
+    });
+
+    const updates = {
+      assignedStaffId: req.user.id,
+      assignedStaffName: req.user.name,
+      status: status || 'IN_PROGRESS',
+      updatedAt: new Date()
+    };
+
+    const updatedTicket = await db.supportTickets.update(ticket.id, updates);
+    await logAudit(req, 'STAFF_SUPPORT_REPLY', 'SUPPORT_TICKET', ticket.id);
+
+    // Trigger non-blocking notification dispatch to ticket customer
+    notificationService.dispatchEvent('SUPPORT_TICKET_REPLY', {
+      user: { id: ticket.userId, email: ticket.userEmail },
+      reference: ticket.ticketNumber,
+      title: `Support Ticket Updated: ${ticket.subject}`,
+      message: message.trim()
+    }).catch(() => {});
+
+    res.json({ success: true, ticket: updatedTicket, reply: replyMsg });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+app.get('/api/admin/contact-inquiries', authenticate, authorize('STAFF', 'ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+
+    const { data: paginatedInquiries, total, totalPages } = await db.contactInquiries.findPaginated({}, null, { page, limit, sort: { createdAt: -1 } });
+
+    res.json({
+      success: true,
+      inquiries: paginatedInquiries,
+      pagination: { total, page, limit, totalPages }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+app.patch('/api/admin/contact-inquiries/:id/resolve', authenticate, authorize('STAFF', 'ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const inquiry = await db.contactInquiries.findById(req.params.id);
+    if (!inquiry) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Inquiry not found.' } });
+
+    const updated = await db.contactInquiries.update(inquiry.id, { resolved: true, resolvedBy: req.user.id, resolvedAt: new Date() });
+    await logAudit(req, 'RESOLVE_CONTACT_INQUIRY', 'CONTACT_INQUIRY', inquiry.id);
+
+    res.json({ success: true, inquiry: updated });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+app.patch('/api/admin/contact-inquiries/:id/status', authenticate, authorize('STAFF', 'ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const { status, staffResponse, adminNotes } = req.body || {};
+    const validStatuses = ['NEW', 'IN_REVIEW', 'CUSTOMER_ACTION_REQUIRED', 'QUOTED', 'CONFIRMED', 'CLOSED', 'CANCELLED'];
+    if (status && !validStatuses.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'INVALID_STATUS', message: `Status must be one of: ${validStatuses.join(', ')}` }
+      });
+    }
+
+    const inquiry = await db.contactInquiries.findById(req.params.id) || await db.contactInquiries.findOne({ reference: req.params.id });
+    if (!inquiry) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Inquiry not found.' } });
+
+    const updates = {};
+    if (status) updates.status = status;
+    if (typeof staffResponse === 'string') updates.staffResponse = staffResponse.trim();
+    if (typeof adminNotes === 'string') updates.adminNotes = adminNotes.trim();
+    if (status === 'CLOSED' || status === 'CONFIRMED') {
+      updates.resolved = true;
+      updates.resolvedBy = req.user.id;
+      updates.resolvedAt = new Date();
+    }
+
+    const updated = await db.contactInquiries.update(inquiry.id, updates);
+    await logAudit(req, 'UPDATE_TRAVEL_INQUIRY_STATUS', 'CONTACT_INQUIRY', inquiry.id, {
+      status: updates.status,
+      reference: inquiry.reference
+    });
+
+    // Notify user if inquiry has an associated customer userId (Failure Isolated)
+    if (inquiry.userId && updates.status) {
+      const isHotel = inquiry.type === 'HOTEL_INQUIRY' || inquiry.type === 'hotel';
+      const eventName = isHotel ? 'HOTEL_INQUIRY_STATUS_UPDATED' : 'FLIGHT_INQUIRY_STATUS_UPDATED';
+      await notificationService.dispatchEvent(eventName, {
+        userId: inquiry.userId,
+        reference: inquiry.reference,
+        status: updates.status,
+        entityType: 'CONTACT_INQUIRY',
+        entityId: inquiry.id,
+        actionUrl: '/account/travel-requests'
+      });
+    }
+
+    res.json({ success: true, inquiry: updated });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// 10.9 NOTIFICATION OPERATIONS & HEALTH MONITORING API (ADMIN/SUPER_ADMIN ONLY)
+app.get('/api/admin/notifications', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+    const status = req.query.status;
+
+    const filter = {};
+    if (status) filter.status = status;
+
+    const { data: notifsData, total, totalPages } = await db.notifications.findPaginated(filter, null, { page, limit, sort: { createdAt: -1 } });
+
+    const safeNotifs = notifsData.map(n => ({
+      id: n.id,
+      userId: n.userId,
+      channel: n.channel,
+      eventType: n.eventType,
+      status: n.status,
+      title: n.title,
+      createdAt: n.createdAt,
+      read: n.read
+    }));
+
+    res.json({
+      success: true,
+      notifications: safeNotifs,
+      pagination: { total, page, limit, totalPages }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+app.post('/api/admin/notifications/:id/resend', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), submissionLimiter, async (req, res) => {
+  try {
+    const notif = await db.notifications.findById(req.params.id);
+    if (!notif) return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Notification log not found.' } });
+
+    await logAudit(req, 'ADMIN_RESEND_NOTIFICATION', 'NOTIFICATION', notif.id);
+
+    const dispatchResult = await notificationService.dispatchEvent(notif.eventType || 'GENERIC_ALERT', {
+      userId: notif.userId,
+      title: notif.title,
+      message: notif.message,
+      idempotencyKey: `resend_${notif.id}_${Date.now()}`
+    });
+
+    res.json({ success: true, message: 'Notification resend dispatched successfully.', dispatch: dispatchResult });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// 10.10 IMMUTABLE AUDIT LOG SYSTEM API (ADMIN/SUPER_ADMIN ONLY)
+app.get('/api/admin/audit-logs', authenticate, authorize('ADMIN', 'SUPER_ADMIN'), async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+
+    const actorRole = req.query.actorRole;
+    const action = req.query.action;
+    const entityType = req.query.entityType;
+    const search = (req.query.search || '').trim();
+
+    const filter = {};
+    if (actorRole) filter.actorRole = actorRole;
+    if (action) filter.action = action;
+    if (entityType) filter.entityType = entityType;
+    if (search) {
+      const rx = new RegExp(escapeRegex(search), 'i');
+      filter.$or = [{ action: rx }, { actorId: rx }, { entityId: rx }];
+    }
+
+    const { data: paginatedLogs, total, totalPages } = await db.auditLogs.findPaginated(filter, null, { page, limit, sort: { createdAt: -1 } });
+
+    res.json({
+      success: true,
+      logs: paginatedLogs,
+      pagination: { total, page, limit, totalPages }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// -------------------------------------------------------------
+// TASK #9: JMT AI CHATBOT & CUSTOMER SUPPORT SYSTEM ROUTES
+// -------------------------------------------------------------
+const chatLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 40,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, error: { code: 'RATE_LIMITED', message: 'Too many chat requests. Please wait 15 minutes.' } }
+});
+
+// 1. Create or retrieve active conversation for authenticated customer
+app.post('/api/chat/conversations', authenticate, i18nMiddleware, async (req, res) => {
+  try {
+    const { title, channel = 'WEB', language } = req.body || {};
+    const normLang = language || req.locale || req.user?.preferredLanguage || 'en';
+
+    let conversation = await db.chatConversations.findOne({
+      customerId: req.user.id,
+      status: 'ACTIVE'
+    });
+
+    if (!conversation) {
+      conversation = await db.chatConversations.create({
+        customerId: req.user.id,
+        title: title || 'Support Chat',
+        channel: channel || 'WEB',
+        language: normLang,
+        status: 'ACTIVE',
+        escalationState: 'AI_ACTIVE'
+      });
+
+      const isAr = normLang === 'ar';
+      const welcomeText = isAr
+        ? 'مرحباً! أنا مساعد JMT الرقمي. كيف يمكنني مساعدتك اليوم؟'
+        : 'Hello! I am JMT Travels AI Assistant. How can I help you today?';
+
+      await db.chatMessages.create({
+        conversationId: conversation.id,
+        sender: 'AI',
+        text: welcomeText,
+        language: normLang
+      });
+    }
+
+    res.status(201).json({ success: true, conversation });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// 2. List authenticated customer's own conversations (IDOR protected)
+app.get('/api/chat/conversations', authenticate, async (req, res) => {
+  try {
+    const conversations = await db.chatConversations.find({ customerId: req.user.id });
+    res.json({ success: true, conversations });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// 3. Get single conversation details with messages (IDOR protected)
+app.get('/api/chat/conversations/:id', authenticate, async (req, res) => {
+  try {
+    const conversation = await db.chatConversations.findById(req.params.id);
+    if (!conversation) {
+      return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Chat conversation not found.' } });
+    }
+
+    const isStaff = ['ADMIN', 'SUPER_ADMIN', 'STAFF'].includes(req.user.role);
+    if (conversation.customerId !== req.user.id && !isStaff) {
+      return res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Access denied to this conversation.' } });
+    }
+
+    let messages = await db.chatMessages.find(
+      { conversationId: conversation.id },
+      null,
+      { sort: { createdAt: -1 }, limit: 20 }
+    );
+    messages.reverse();
+
+    res.json({ success: true, conversation, messages });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// 4. Send message to AI chatbot in a conversation (IDOR & Rate Limited)
+app.post('/api/chat/conversations/:id/messages', chatLimiter, authenticate, i18nMiddleware, async (req, res) => {
+  try {
+    const conversation = await db.chatConversations.findById(req.params.id);
+    if (!conversation) {
+      return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Chat conversation not found.' } });
+    }
+
+    const isStaff = ['ADMIN', 'SUPER_ADMIN', 'STAFF'].includes(req.user.role);
+    if (conversation.customerId !== req.user.id && !isStaff) {
+      return res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Access denied to this conversation.' } });
+    }
+
+    const { text, language } = req.body || {};
+    if (!text || !text.trim()) {
+      return res.status(400).json({ success: false, error: { code: 'INVALID_INPUT', message: 'Message text is required.' } });
+    }
+
+    const msgLang = language || req.locale || conversation.language || 'en';
+
+    const userMessage = await db.chatMessages.create({
+      conversationId: conversation.id,
+      sender: 'CUSTOMER',
+      text: text.trim(),
+      language: msgLang
+    });
+
+    await db.chatConversations.update(conversation.id, { lastMessageAt: new Date().toISOString() });
+
+    const result = await chatbotService.processMessage({
+      message: text,
+      conversationId: conversation.id,
+      user: req.user,
+      locale: msgLang
+    });
+
+    const aiMessage = await db.chatMessages.create({
+      conversationId: conversation.id,
+      sender: 'AI',
+      text: result.reply,
+      language: msgLang,
+      metadata: { quickReplies: result.quickReplies, ticketNumber: result.ticketNumber }
+    });
+
+    if (result.escalationState) {
+      await db.chatConversations.update(conversation.id, { escalationState: result.escalationState });
+    }
+
+    res.json({
+      success: true,
+      userMessage,
+      aiResponse: aiMessage,
+      escalationState: result.escalationState || conversation.escalationState,
+      quickReplies: result.quickReplies
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// 5. Explicit Escalate Conversation to Human Support Desk
+app.post('/api/chat/conversations/:id/escalate', authenticate, i18nMiddleware, async (req, res) => {
+  try {
+    const conversation = await db.chatConversations.findById(req.params.id);
+    if (!conversation) {
+      return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Chat conversation not found.' } });
+    }
+
+    const isStaff = ['ADMIN', 'SUPER_ADMIN', 'STAFF'].includes(req.user.role);
+    if (conversation.customerId !== req.user.id && !isStaff) {
+      return res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Access denied to this conversation.' } });
+    }
+
+    const { reason } = req.body || {};
+    const escResult = await chatTools.escalateToHuman(req.user, conversation.id, reason || 'Customer requested human agent escalation.');
+
+    const sysMessage = await db.chatMessages.create({
+      conversationId: conversation.id,
+      sender: 'SYSTEM',
+      text: req.locale === 'ar'
+        ? `تم تصعيد المحادثة إلى فريق الدعم. رقم التذكرة المرتبطة: ${escResult.ticket ? escResult.ticket.ticketNumber : 'N/A'}`
+        : `Conversation escalated to customer support. Linked Ticket #: ${escResult.ticket ? escResult.ticket.ticketNumber : 'N/A'}`,
+      language: req.locale || 'en'
+    });
+
+    const updatedConv = await db.chatConversations.findById(conversation.id);
+    res.json({
+      success: true,
+      conversation: updatedConv,
+      ticket: escResult.ticket,
+      systemMessage: sysMessage
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// 6. Admin/Staff: List Conversations (Active / Escalated)
+app.get('/api/admin/chat/conversations', authenticate, async (req, res) => {
+  try {
+    const isStaff = ['ADMIN', 'SUPER_ADMIN', 'STAFF'].includes(req.user.role);
+    if (!isStaff) {
+      return res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Admin / Staff access required.' } });
+    }
+
+    const { status, escalationState } = req.query;
+    const filter = {};
+    if (status) filter.status = status;
+    if (escalationState) filter.escalationState = escalationState;
+
+    const conversations = await db.chatConversations.find(filter);
+    res.json({ success: true, conversations });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// 7. Admin/Staff: Reply to Customer Conversation
+app.post('/api/admin/chat/conversations/:id/reply', authenticate, async (req, res) => {
+  try {
+    const isStaff = ['ADMIN', 'SUPER_ADMIN', 'STAFF'].includes(req.user.role);
+    if (!isStaff) {
+      return res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Admin / Staff access required.' } });
+    }
+
+    const conversation = await db.chatConversations.findById(req.params.id);
+    if (!conversation) {
+      return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Chat conversation not found.' } });
+    }
+
+    const { text } = req.body || {};
+    if (!text || !text.trim()) {
+      return res.status(400).json({ success: false, error: { code: 'INVALID_INPUT', message: 'Reply text is required.' } });
+    }
+
+    const staffMsg = await db.chatMessages.create({
+      conversationId: conversation.id,
+      sender: 'STAFF',
+      text: text.trim(),
+      language: conversation.language || 'en'
+    });
+
+    await db.chatConversations.update(conversation.id, {
+      escalationState: 'STAFF_ACTIVE',
+      assignedStaffId: req.user.id,
+      lastMessageAt: new Date().toISOString()
+    });
+
+    const customer = await db.users.findById(conversation.customerId);
+    if (customer) {
+      await notificationService.dispatchEvent('SUPPORT_TICKET_UPDATED', {
+        user: customer,
+        reference: conversation.id
+      });
+    }
+
+    const updatedConv = await db.chatConversations.findById(conversation.id);
+    res.json({ success: true, message: staffMsg, conversation: updatedConv });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+
+
+// Global Database & Application Error Handling Middleware
+app.use((err, req, res, next) => {
+  if (err.code === 'DATABASE_UNAVAILABLE' || err.statusCode === 503) {
+    return res.status(503).json({
+      success: false,
+      error: {
+        code: 'DATABASE_UNAVAILABLE',
+        message: 'Database service unavailable. Required MongoDB connection is offline in production.'
+      }
+    });
+  }
+  console.error('[Unhandled Express Error]:', err.message);
+  res.status(err.statusCode || 500).json({
+    success: false,
+    error: {
+      code: err.code || 'SERVER_ERROR',
+      message: err.message || 'An unexpected server error occurred.'
+    }
+  });
+});
+
+// Fallback to index.html for SPA frontend routes with dynamic SSR meta tag injection
+app.get('*', async (req, res) => {
+  if (req.path.startsWith('/admin')) {
+    return res.sendFile(path.join(__dirname, '../frontend/public/admin.html'));
+  }
+
+  const indexPath = path.join(__dirname, '../frontend/public/index.html');
+  try {
+    let html = fs.readFileSync(indexPath, 'utf8');
+    const baseUrl = process.env.BASE_URL || 'https://jmttravels.com';
+
+    // Disallow private pages from search engine indexing
+    const privateRoutes = ['/account', '/visa-apply', '/book', '/documents'];
+    const isPrivate = privateRoutes.some(p => req.path.startsWith(p));
+
+    if (isPrivate) {
+      if (html.includes('</head>')) {
+        html = html.replace('</head>', '  <meta name="robots" content="noindex, nofollow">\n</head>');
+      }
+    }
+
+    if (req.path.startsWith('/tourism/')) {
+      const slug = req.path.replace('/tourism/', '').split('?')[0];
+      const pkg = await db.tourPackages.findOne({ slug });
+      if (pkg) {
+        html = html.replace(/<title>.*?<\/title>/, `<title>${pkg.title} | JMT Travels</title>`);
+        html = html.replace(/<meta name="description" content=".*?">/, `<meta name="description" content="${pkg.summary || pkg.title}">`);
+        html = html.replace(/href="https:\/\/jmttravels.com\/"/, `href="${baseUrl}/tourism/${pkg.slug}"`);
+      }
+    } else if (req.path.startsWith('/visa/')) {
+      const slug = req.path.replace('/visa/', '').split('?')[0];
+      const service = await db.visaServices.findOne({ slug });
+      if (service) {
+        html = html.replace(/<title>.*?<\/title>/, `<title>${service.country} ${service.visaType} Visa | JMT Travels</title>`);
+        html = html.replace(/<meta name="description" content=".*?">/, `<meta name="description" content="${service.overview || service.visaType}">`);
+        html = html.replace(/href="https:\/\/jmttravels.com\/"/, `href="${baseUrl}/visa/${service.slug}"`);
+      }
+    }
+
+    res.send(html);
+  } catch (err) {
+    res.sendFile(indexPath);
+  }
+});
+
+// Start Server if main module
+if (require.main === module) {
+  db.connectDB().then(() => {
+    seedInitialData().then(() => {
+      const server = app.listen(PORT, () => {
+        console.log(`====================================================`);
+        console.log(`✈️  JMT TRAVELS Master V1 API Server Running`);
+        console.log(`📍 URL: http://localhost:${PORT}`);
+        console.log(`====================================================`);
+      });
+
+      server.on('error', (err) => {
+        if (err.code === 'EADDRINUSE') {
+          console.error(`\n❌ Error: Port ${PORT} is already in use by another process.`);
+          console.error(`💡 Solution: Free port ${PORT} or configure a different PORT in your .env file.\n`);
+          process.exit(1);
+        } else {
+          console.error('Server error:', err);
+        }
+      });
+    });
+  });
+}
+
+app.seedInitialData = seedInitialData;
+
+module.exports = app;
